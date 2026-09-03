@@ -1,0 +1,11 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "babylon-usd-importer",
+  "version": "0.1.0",
+  "description": "OpenUSD WebAssembly scene importer for Babylon.js.",
+  "homepage": "https://github.com/SergioRZMasson/babylon-usd-importer",
+  "builtin-baseline": "9885cff3673359c51faa080e1252925c203b9f34",
+  "dependencies": [
+    "usd"
+  ]
+}

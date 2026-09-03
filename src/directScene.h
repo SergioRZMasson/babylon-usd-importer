@@ -1,0 +1,28 @@
+#pragma once
+
+#include <pxr/usd/usd/stage.h>
+
+#include <cstdint>
+#include <vector>
+
+namespace babylon::usd_importer {
+
+struct SceneBuffers
+{
+    std::vector<uint8_t> commands;
+    std::vector<uint8_t> data;
+    double stageReadMs = 0.0;
+    double preparationMs = 0.0;
+    double packingMs = 0.0;
+    uint32_t nodeCount = 0;
+    uint32_t meshCount = 0;
+    uint32_t instanceCount = 0;
+    uint32_t materialCount = 0;
+    uint64_t vertexCount = 0;
+    uint64_t triangleCount = 0;
+};
+
+bool
+buildSceneBuffers(const PXR_NS::UsdStageRefPtr& stage, SceneBuffers& result);
+
+} // namespace babylon::usd_importer

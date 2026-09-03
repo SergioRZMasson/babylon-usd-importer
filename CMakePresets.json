@@ -1,0 +1,64 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "wasm",
+      "displayName": "Babylon USD importer WebAssembly",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/wasm",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "VCPKG_TARGET_TRIPLET": "wasm32-emscripten",
+        "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "${sourceDir}/cmake/emscripten.cmake",
+        "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/triplets",
+        "VCPKG_OVERLAY_PORTS": "${sourceDir}/ports",
+        "VCPKG_INSTALLED_DIR": "${sourceDir}/build/vcpkg_installed",
+        "VCPKG_MANIFEST_INSTALL": "ON"
+      },
+      "environment": {
+        "VCPKG_FEATURE_FLAGS": "manifests,versions"
+      }
+    },
+    {
+      "name": "wasm-package",
+      "displayName": "WebAssembly and TypeScript package",
+      "inherits": "wasm",
+      "binaryDir": "${sourceDir}/build/wasm-package",
+      "cacheVariables": {
+        "BUILD_NPM_PACKAGE": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "wasm",
+      "configurePreset": "wasm"
+    },
+    {
+      "name": "wasm-package",
+      "configurePreset": "wasm-package"
+    }
+  ],
+  "workflowPresets": [
+    {
+      "name": "wasm",
+      "steps": [
+        { "type": "configure", "name": "wasm" },
+        { "type": "build", "name": "wasm" }
+      ]
+    },
+    {
+      "name": "wasm-package",
+      "steps": [
+        { "type": "configure", "name": "wasm-package" },
+        { "type": "build", "name": "wasm-package" }
+      ]
+    }
+  ]
+}

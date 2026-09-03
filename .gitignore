@@ -1,0 +1,15 @@
+build/
+build-*/
+vcpkg_installed/
+node_modules/
+package/dist/
+
+# Generated GitHub Pages demo. The initial release commits docs/ intentionally.
+
+*.o
+*.a
+
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
