@@ -87,22 +87,6 @@ one. Flattening was required only by file-format-export workflows. Reading the c
 stage directly avoids that extra allocation and preserves native instance/prototype
 relationships.
 
-### No submodules
-
-The repository has no git submodules. Its native dependency is OpenUSD, consumed through
-vcpkg. OpenUSD brings its required oneTBB and zlib dependencies transitively.
-
-There are no dependencies on:
-
-- Adobe USD-Fileformat-plugins;
-- TinyGLTF;
-- meshoptimizer;
-- nlohmann-json;
-- GLB or `.babylon` serialization libraries.
-
-The repository-owned weld compares complete vertex streams exactly, preserving normal, UV,
-color, opacity, and skinning seams while emitting vertices in first-use order.
-
 ## Supported runtime data
 
 - USD, USDA, USDC, and USDZ root layers.
