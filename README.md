@@ -103,25 +103,6 @@ There are no dependencies on:
 The repository-owned weld compares complete vertex streams exactly, preserving normal, UV,
 color, opacity, and skinning seams while emitting vertices in first-use order.
 
-## Performance baseline
-
-Representative warm browser conversions on Apple silicon:
-
-| Input | OpenUSD open | Traversal | Vertex preparation | Packing | Native total | Command + data |
-|---|---:|---:|---:|---:|---:|---:|
-| botsinbox | 540 ms | 41 ms | 81 ms | 2 ms | 664 ms | 22.57 MB |
-| botsinbox 2 | 454 ms | 28 ms | 53 ms | 1 ms | 536 ms | 15.03 MB |
-
-Geometry remained equivalent to the optimized `usd-web` direct path:
-
-| Input | Source meshes | Instances | Unique vertices | Unique triangles |
-|---|---:|---:|---:|---:|
-| botsinbox | 57 | 16 | 554,439 | 601,842 |
-| botsinbox 2 | 27 | 0 | 387,289 | 425,812 |
-
-The release Wasm module is approximately **8.89 MB raw** and **2.31 MB with gzip -9**.
-Private benchmark assets are not included in this repository.
-
 ## Supported runtime data
 
 - USD, USDA, USDC, and USDZ root layers.
