@@ -2,7 +2,7 @@
 
 An experimental foundation for loading USD assets directly into Babylon.js at runtime.
 
-**[Live demo](https://sergiozmasson.github.io/babylon-usd-importer/)**
+**[Live demo](https://sergiorzmasson.github.io/babylon-usd-importer/)**
 
 The importer opens a composed USD stage with Pixar OpenUSD in WebAssembly, traverses and
 prepares the renderable scene in C++, then returns two transferable buffers:
