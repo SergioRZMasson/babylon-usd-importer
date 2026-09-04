@@ -161,6 +161,7 @@ async function extract(request: ExtractRequest): Promise<void> {
                     statistics: {
                         nodes: result.nodeCount(),
                         meshes: result.meshCount(),
+                        analyticPrimitives: result.analyticPrimitiveCount(),
                         instances: result.instanceCount(),
                         materials: result.materialCount(),
                         vertices: result.vertexCount(),

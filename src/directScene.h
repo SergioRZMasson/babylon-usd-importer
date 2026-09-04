@@ -16,6 +16,7 @@ struct SceneBuffers
     double packingMs = 0.0;
     uint32_t nodeCount = 0;
     uint32_t meshCount = 0;
+    uint32_t analyticPrimitiveCount = 0;
     uint32_t instanceCount = 0;
     uint32_t materialCount = 0;
     uint64_t vertexCount = 0;

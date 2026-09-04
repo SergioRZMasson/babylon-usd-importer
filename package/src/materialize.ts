@@ -10,6 +10,9 @@ import { Material } from "@babylonjs/core/Materials/material.js";
 import { MultiMaterial } from "@babylonjs/core/Materials/multiMaterial.js";
 import { PBRMaterial } from "@babylonjs/core/Materials/PBR/pbrMaterial.js";
 import { Texture } from "@babylonjs/core/Materials/Textures/texture.js";
+import { CreateBox } from "@babylonjs/core/Meshes/Builders/boxBuilder.js";
+import { CreateCylinder } from "@babylonjs/core/Meshes/Builders/cylinderBuilder.js";
+import { CreateSphere } from "@babylonjs/core/Meshes/Builders/sphereBuilder.js";
 import { Mesh } from "@babylonjs/core/Meshes/mesh.js";
 import "@babylonjs/core/Meshes/instancedMesh.js";
 import { SubMesh } from "@babylonjs/core/Meshes/subMesh.js";
@@ -20,6 +23,7 @@ import { pbrPixelShader } from "@babylonjs/core/Shaders/pbr.fragment.js";
 import { pbrVertexShader } from "@babylonjs/core/Shaders/pbr.vertex.js";
 
 import {
+    AnalyticPrimitiveType,
     AnimationProperty,
     AnimationTarget,
     Command,
@@ -28,6 +32,7 @@ import {
     MeshFlags,
     MISSING_OFFSET,
     PayloadReader,
+    PrimitiveAxis,
     readCommands,
 } from "./protocol.js";
 
@@ -157,6 +162,29 @@ export async function materializeCommandBuffers(
     const textureLoads: Promise<void>[] = [];
     let root: TransformNode | undefined;
     let timeCodesPerSecond = 24;
+
+    const applyMeshOrientation = (mesh: Mesh, flags: number): void => {
+        const sourceIsRightHanded = !(flags & MeshFlags.LeftHanded);
+        mesh.sideOrientation =
+            scene.useRightHandedSystem === sourceIsRightHanded
+                ? Material.CounterClockWiseSideOrientation
+                : Material.ClockWiseSideOrientation;
+    };
+    const materialForMesh = (id: number, doubleSided: boolean): PBRMaterial | null => {
+        const material = materials.get(id);
+        if (!material || !doubleSided || !material.backFaceCulling) {
+            return material ?? null;
+        }
+        let variant = doubleSidedMaterials.get(id);
+        if (!variant) {
+            variant = material.clone(`${material.name} (double-sided)`);
+            variant.backFaceCulling = false;
+            variant.twoSidedLighting = true;
+            doubleSidedMaterials.set(id, variant);
+            container.materials.push(variant);
+        }
+        return variant;
+    };
 
     try {
     for (const command of commands) {
@@ -429,11 +457,7 @@ export async function materializeCommandBuffers(
                     throw new Error(`Mesh ${id} references missing geometry ${geometryId}.`);
                 }
                 const mesh = new Mesh(stringAt(dataBuffer, nameOffset, nameLength), scene);
-                const sourceIsRightHanded = !(flags & MeshFlags.LeftHanded);
-                mesh.sideOrientation =
-                    scene.useRightHandedSystem === sourceIsRightHanded
-                        ? Material.CounterClockWiseSideOrientation
-                        : Material.ClockWiseSideOrientation;
+                applyMeshOrientation(mesh, flags);
                 mesh.parent = nodes.get(nodeId) ?? root ?? null;
                 const vertexData = new VertexData();
                 assertRange(
@@ -575,29 +599,17 @@ export async function materializeCommandBuffers(
                 const submeshView = new DataView(dataBuffer);
                 assertRange(dataBuffer, submeshesOffset, submeshCount * 5, 4, "submeshes");
                 const doubleSided = Boolean(flags & MeshFlags.DoubleSided);
-                const materialForMesh = (id: number): PBRMaterial | null => {
-                    const material = materials.get(id);
-                    if (!material || !doubleSided || !material.backFaceCulling) {
-                        return material ?? null;
-                    }
-                    let variant = doubleSidedMaterials.get(id);
-                    if (!variant) {
-                        variant = material.clone(`${material.name} (double-sided)`);
-                        variant.backFaceCulling = false;
-                        variant.twoSidedLighting = true;
-                        doubleSidedMaterials.set(id, variant);
-                        container.materials.push(variant);
-                    }
-                    return variant;
-                };
                 if (submeshCount === 1 && materialId !== MISSING_OFFSET) {
-                    mesh.material = materialForMesh(materialId);
+                    mesh.material = materialForMesh(materialId, doubleSided);
                 } else {
                     const multi = new MultiMaterial(`${mesh.name} materials`, scene);
                     for (let index = 0; index < submeshCount; ++index) {
                         const offset = submeshesOffset + index * 20;
                         multi.subMaterials.push(
-                            materialForMesh(submeshView.getUint32(offset, true)),
+                            materialForMesh(
+                                submeshView.getUint32(offset, true),
+                                doubleSided,
+                            ),
                         );
                     }
                     mesh.material = multi;
@@ -617,6 +629,114 @@ export async function materializeCommandBuffers(
                 }
                 meshes.set(id, mesh);
                 container.meshes.push(mesh);
+                if (mesh.geometry) {
+                    container.geometries.push(mesh.geometry);
+                }
+                break;
+            }
+            case Command.AnalyticPrimitive: {
+                const id = payload.u32();
+                const nodeId = payload.u32();
+                const type = payload.u32();
+                const materialId = payload.u32();
+                const nameOffset = payload.u32();
+                const nameLength = payload.u32();
+                const flags = payload.u32();
+                const axis = payload.u32();
+                const sizeOrRadius = payload.f32();
+                const height = payload.f32();
+                const tessellation = payload.u32();
+                const name = stringAt(dataBuffer, nameOffset, nameLength);
+                if (!Number.isFinite(sizeOrRadius) || sizeOrRadius <= 0) {
+                    throw new Error(`Analytic primitive ${id} has an invalid size or radius.`);
+                }
+                if (
+                    (type === AnalyticPrimitiveType.Cylinder ||
+                        type === AnalyticPrimitiveType.Cone) &&
+                    (!Number.isFinite(height) || height <= 0)
+                ) {
+                    throw new Error(`Analytic primitive ${id} has an invalid height.`);
+                }
+                if (
+                    type !== AnalyticPrimitiveType.Cube &&
+                    (!Number.isInteger(tessellation) ||
+                        tessellation < 3 ||
+                        tessellation > 512)
+                ) {
+                    throw new Error(`Analytic primitive ${id} has invalid tessellation.`);
+                }
+                let mesh: Mesh;
+                switch (type) {
+                    case AnalyticPrimitiveType.Cube:
+                        mesh = CreateBox(name, { size: sizeOrRadius }, scene);
+                        break;
+                    case AnalyticPrimitiveType.Sphere:
+                        mesh = CreateSphere(
+                            name,
+                            {
+                                diameter: sizeOrRadius * 2,
+                                segments: tessellation,
+                            },
+                            scene,
+                        );
+                        break;
+                    case AnalyticPrimitiveType.Cylinder:
+                    case AnalyticPrimitiveType.Cone:
+                        mesh = CreateCylinder(
+                            name,
+                            {
+                                height,
+                                diameterTop:
+                                    type === AnalyticPrimitiveType.Cone
+                                        ? 0
+                                        : sizeOrRadius * 2,
+                                diameterBottom: sizeOrRadius * 2,
+                                tessellation,
+                            },
+                            scene,
+                        );
+                        break;
+                    default:
+                        throw new Error(`Unsupported analytic primitive type ${type}.`);
+                }
+
+                // Babylon builders emit left-handed local winding. Reverse only for USD's
+                // default right-handed convention; normals already point outward.
+                if (!(flags & MeshFlags.LeftHanded)) {
+                    const sourceIndices = mesh.getIndices();
+                    if (!sourceIndices) {
+                        throw new Error(`Analytic primitive ${id} has no generated indices.`);
+                    }
+                    const reversed = Array.from(sourceIndices);
+                    for (let index = 0; index < reversed.length; index += 3) {
+                        [reversed[index], reversed[index + 2]] = [
+                            reversed[index + 2],
+                            reversed[index],
+                        ];
+                    }
+                    mesh.setIndices(reversed);
+                }
+                if (axis === PrimitiveAxis.X) {
+                    mesh.rotationQuaternion = Quaternion.RotationAxis(
+                        new Vector3(0, 0, 1),
+                        -Math.PI / 2,
+                    );
+                } else if (axis === PrimitiveAxis.Z) {
+                    mesh.rotationQuaternion = Quaternion.RotationAxis(
+                        new Vector3(1, 0, 0),
+                        Math.PI / 2,
+                    );
+                } else if (axis !== PrimitiveAxis.Y) {
+                    throw new Error(`Unsupported analytic primitive axis ${axis}.`);
+                }
+                applyMeshOrientation(mesh, flags);
+                mesh.parent = nodes.get(nodeId) ?? root ?? null;
+                mesh.material = materialForMesh(
+                    materialId,
+                    Boolean(flags & MeshFlags.DoubleSided),
+                );
+                container.meshes.push(mesh);
+                meshes.set(id, mesh);
                 if (mesh.geometry) {
                     container.geometries.push(mesh.geometry);
                 }

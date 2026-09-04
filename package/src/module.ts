@@ -12,6 +12,7 @@ export interface NativeImportResult {
     packingMs(): number;
     nodeCount(): number;
     meshCount(): number;
+    analyticPrimitiveCount(): number;
     instanceCount(): number;
     materialCount(): number;
     vertexCount(): number;

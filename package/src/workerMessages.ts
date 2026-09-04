@@ -28,6 +28,7 @@ export interface WorkerTimings {
 export interface WorkerStatistics {
     nodes: number;
     meshes: number;
+    analyticPrimitives: number;
     instances: number;
     materials: number;
     vertices: number;

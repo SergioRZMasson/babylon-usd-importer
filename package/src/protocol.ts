@@ -1,5 +1,5 @@
 export const COMMAND_MAGIC = 0x42445355;
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 export const MISSING_OFFSET = 0xffffffff;
 
 export const enum Command {
@@ -12,6 +12,20 @@ export const enum Command {
     Mesh = 7,
     Instance = 8,
     Animation = 9,
+    AnalyticPrimitive = 10,
+}
+
+export const enum AnalyticPrimitiveType {
+    Cube = 0,
+    Sphere = 1,
+    Cylinder = 2,
+    Cone = 3,
+}
+
+export const enum PrimitiveAxis {
+    X = 0,
+    Y = 1,
+    Z = 2,
 }
 
 export const enum AnimationTarget {
@@ -72,6 +86,8 @@ function expectedPayloadLength(opcode: Command): number {
             return 16;
         case Command.Animation:
             return 32;
+        case Command.AnalyticPrimitive:
+            return 44;
         default:
             throw new Error(`Unknown OpenUSD Babylon command opcode ${opcode}.`);
     }

@@ -96,6 +96,8 @@ relationships.
 - Y-up/Z-up and Babylon left-/right-handed scene conversion.
 - USD `rightHanded`/`leftHanded` mesh orientation and winding validation.
 - Polygon triangulation and USD primvar interpolation.
+- Native `UsdGeomCube`, `UsdGeomSphere`, `UsdGeomCylinder`, and `UsdGeomCone` commands
+  materialized through Babylon procedural mesh builders.
 - Material binding subsets.
 - Exact vertex welding and indexed geometry.
 - `UsdPreviewSurface`, `UsdUVTexture`, `UsdTransform2d`, and primvar readers.
@@ -111,8 +113,9 @@ relationships.
 - Separately authored metallic and roughness textures are not repacked yet.
 - MaterialX, MDL, OpenPBR, and other surface models fall back explicitly.
 - Browser-unsupported image formats require native transcoding.
-- Blend shapes, point instancers, analytic gprims, cameras, lights, physics, and runtime
+- Blend shapes, point instancers, cameras, lights, physics, and runtime
   variant switching are not yet represented by the command protocol.
+- Analytic primitive dimensions are currently sampled at the default time.
 - Babylon object construction runs on the main thread after worker extraction.
 
 ## Build

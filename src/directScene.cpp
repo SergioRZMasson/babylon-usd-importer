@@ -18,11 +18,15 @@
 #include <pxr/usd/usd/primRange.h>
 #include <pxr/usd/usdGeom/gprim.h>
 #include <pxr/usd/usdGeom/imageable.h>
+#include <pxr/usd/usdGeom/cone.h>
+#include <pxr/usd/usdGeom/cube.h>
+#include <pxr/usd/usdGeom/cylinder.h>
 #include <pxr/usd/usdGeom/mesh.h>
 #include <pxr/usd/usdGeom/metrics.h>
 #include <pxr/usd/usdGeom/primvar.h>
 #include <pxr/usd/usdGeom/primvarsAPI.h>
 #include <pxr/usd/usdGeom/subset.h>
+#include <pxr/usd/usdGeom/sphere.h>
 #include <pxr/usd/usdGeom/tokens.h>
 #include <pxr/usd/usdGeom/xformable.h>
 #include <pxr/usd/usdShade/connectableAPI.h>
@@ -242,6 +246,19 @@ struct MeshData
     std::vector<uint32_t> nodeIds;
 };
 
+struct AnalyticPrimitiveData
+{
+    std::string name;
+    std::vector<uint32_t> nodeIds;
+    uint32_t materialId = 0;
+    uint32_t flags = 0;
+    AnalyticPrimitiveType type = AnalyticPrimitiveType::Cube;
+    PrimitiveAxis axis = PrimitiveAxis::Y;
+    float sizeOrRadius = 1.0f;
+    float height = 0.0f;
+    uint32_t tessellation = 32;
+};
+
 struct SkeletonAnimation
 {
     std::vector<float> times;
@@ -276,6 +293,9 @@ struct SceneData
     std::vector<MeshData> meshes;
     std::unordered_map<std::string, size_t> meshIds;
     std::unordered_map<std::string, bool> meshWinding;
+    std::vector<AnalyticPrimitiveData> analyticPrimitives;
+    std::unordered_map<std::string, size_t> analyticPrimitiveIds;
+    std::unordered_map<std::string, uint32_t> analyticMaterialIds;
     std::vector<SkeletonData> skeletons;
     std::unordered_map<std::string, uint32_t> skeletonIds;
     std::unordered_map<std::string, SkinBinding> skinBindings;
@@ -1482,6 +1502,160 @@ isVisible(const UsdPrim& prim)
            imageable.ComputeVisibility(UsdTimeCode::Default()) != UsdGeomTokens->invisible;
 }
 
+PrimitiveAxis
+primitiveAxis(const TfToken& axis)
+{
+    if (axis == UsdGeomTokens->x) {
+        return PrimitiveAxis::X;
+    }
+    if (axis == UsdGeomTokens->y) {
+        return PrimitiveAxis::Y;
+    }
+    return PrimitiveAxis::Z;
+}
+
+uint32_t
+analyticMaterialId(SceneData& scene, const UsdPrim& prim)
+{
+    const uint32_t bound = boundMaterialId(scene, prim);
+    if (bound != 0) {
+        return bound;
+    }
+    const UsdPrim source = prim.IsInstanceProxy() ? prim.GetPrimInPrototype() : prim;
+    const std::string key =
+      source ? source.GetPath().GetString() : prim.GetPath().GetString();
+    const auto cached = scene.analyticMaterialIds.find(key);
+    if (cached != scene.analyticMaterialIds.end()) {
+        return cached->second;
+    }
+    const UsdGeomGprim gprim(prim);
+    const PrimvarData<GfVec3f> color =
+      readAuthoredPrimvar<GfVec3f>(gprim.GetDisplayColorPrimvar());
+    const PrimvarData<float> opacity =
+      readAuthoredPrimvar<float>(gprim.GetDisplayOpacityPrimvar());
+    if (!color && !opacity) {
+        scene.analyticMaterialIds.emplace(key, 0);
+        return 0;
+    }
+
+    MaterialData material;
+    material.name = displayName(prim, "Primitive") + " display material";
+    const bool constantColor =
+      color && std::all_of(color.values.begin(),
+                           color.values.end(),
+                           [&](const GfVec3f& value) {
+                               return value == color.values.front();
+                           });
+    const bool constantOpacity =
+      opacity && std::all_of(opacity.values.begin(),
+                             opacity.values.end(),
+                             [&](float value) {
+                                 return value == opacity.values.front();
+                             });
+    if (color && !constantColor) {
+        TF_WARN("Ignoring varying displayColor on analytic primitive <%s>.",
+                prim.GetPath().GetText());
+    }
+    if (opacity && !constantOpacity) {
+        TF_WARN("Ignoring varying displayOpacity on analytic primitive <%s>.",
+                prim.GetPath().GetText());
+    }
+    if (constantColor) {
+        material.baseColor = color.values.front();
+    }
+    if (constantOpacity) {
+        material.opacity = opacity.values.front();
+    }
+    if (!constantColor && !constantOpacity) {
+        scene.analyticMaterialIds.emplace(key, 0);
+        return 0;
+    }
+    scene.materials.push_back(std::move(material));
+    const uint32_t id = static_cast<uint32_t>(scene.materials.size() - 1);
+    scene.analyticMaterialIds.emplace(key, id);
+    return id;
+}
+
+bool
+extractAnalyticPrimitive(const UsdPrim& prim, uint32_t nodeId, SceneData& scene)
+{
+    AnalyticPrimitiveData primitive;
+    primitive.name = displayName(prim, "Primitive");
+    primitive.nodeIds.push_back(nodeId);
+    primitive.materialId = analyticMaterialId(scene, prim);
+
+    if (prim.IsA<UsdGeomCube>()) {
+        double size = 2.0;
+        UsdGeomCube(prim).GetSizeAttr().Get(&size, UsdTimeCode::Default());
+        primitive.type = AnalyticPrimitiveType::Cube;
+        primitive.sizeOrRadius = static_cast<float>(size);
+        primitive.tessellation = 0;
+    } else if (prim.IsA<UsdGeomSphere>()) {
+        double radius = 1.0;
+        UsdGeomSphere(prim).GetRadiusAttr().Get(&radius, UsdTimeCode::Default());
+        primitive.type = AnalyticPrimitiveType::Sphere;
+        primitive.sizeOrRadius = static_cast<float>(radius);
+    } else if (prim.IsA<UsdGeomCylinder>()) {
+        double radius = 1.0;
+        double height = 2.0;
+        TfToken axis = UsdGeomTokens->z;
+        const UsdGeomCylinder cylinder(prim);
+        cylinder.GetRadiusAttr().Get(&radius, UsdTimeCode::Default());
+        cylinder.GetHeightAttr().Get(&height, UsdTimeCode::Default());
+        cylinder.GetAxisAttr().Get(&axis, UsdTimeCode::Default());
+        primitive.type = AnalyticPrimitiveType::Cylinder;
+        primitive.axis = primitiveAxis(axis);
+        primitive.sizeOrRadius = static_cast<float>(radius);
+        primitive.height = static_cast<float>(height);
+    } else if (prim.IsA<UsdGeomCone>()) {
+        double radius = 1.0;
+        double height = 2.0;
+        TfToken axis = UsdGeomTokens->z;
+        const UsdGeomCone cone(prim);
+        cone.GetRadiusAttr().Get(&radius, UsdTimeCode::Default());
+        cone.GetHeightAttr().Get(&height, UsdTimeCode::Default());
+        cone.GetAxisAttr().Get(&axis, UsdTimeCode::Default());
+        primitive.type = AnalyticPrimitiveType::Cone;
+        primitive.axis = primitiveAxis(axis);
+        primitive.sizeOrRadius = static_cast<float>(radius);
+        primitive.height = static_cast<float>(height);
+    } else {
+        return false;
+    }
+    if (!std::isfinite(primitive.sizeOrRadius) || primitive.sizeOrRadius <= 0.0f ||
+        ((primitive.type == AnalyticPrimitiveType::Cylinder ||
+          primitive.type == AnalyticPrimitiveType::Cone) &&
+         (!std::isfinite(primitive.height) || primitive.height <= 0.0f))) {
+        TF_WARN("Skipping analytic primitive <%s> with invalid dimensions.",
+                prim.GetPath().GetText());
+        return false;
+    }
+
+    const UsdGeomGprim gprim(prim);
+    bool doubleSided = false;
+    TfToken orientation = UsdGeomTokens->rightHanded;
+    gprim.GetDoubleSidedAttr().Get(&doubleSided, UsdTimeCode::Default());
+    gprim.GetOrientationAttr().Get(&orientation, UsdTimeCode::Default());
+    primitive.flags = doubleSided ? MeshDoubleSided : 0;
+    primitive.flags |= orientation == UsdGeomTokens->leftHanded ? MeshLeftHanded : 0;
+    const UsdPrim source = prim.IsInstanceProxy() ? prim.GetPrimInPrototype() : prim;
+    const std::string sourcePath =
+      source ? source.GetPath().GetString() : prim.GetPath().GetString();
+    const std::string key =
+      sourcePath + "|" + std::to_string(static_cast<uint32_t>(primitive.type)) + "|" +
+      std::to_string(primitive.materialId) + "|" + std::to_string(primitive.flags) + "|" +
+      std::to_string(static_cast<uint32_t>(primitive.axis)) + "|" +
+      std::to_string(primitive.sizeOrRadius) + "|" + std::to_string(primitive.height);
+    const auto cachedPrimitive = scene.analyticPrimitiveIds.find(key);
+    if (cachedPrimitive != scene.analyticPrimitiveIds.end()) {
+        scene.analyticPrimitives[cachedPrimitive->second].nodeIds.push_back(nodeId);
+        return true;
+    }
+    scene.analyticPrimitiveIds.emplace(key, scene.analyticPrimitives.size());
+    scene.analyticPrimitives.push_back(std::move(primitive));
+    return true;
+}
+
 bool
 extractStage(const UsdStageRefPtr& stage, SceneData& scene)
 {
@@ -1501,15 +1675,19 @@ extractStage(const UsdStageRefPtr& stage, SceneData& scene)
             nodeId = static_cast<uint32_t>(scene.nodes.size());
             scene.nodeIds[prim.GetPath().GetString()] = nodeId;
         }
-        if (!prim.IsA<UsdGeomMesh>() || nodeId == kMissingOffset) {
+        if (nodeId == kMissingOffset) {
             continue;
         }
-        const auto skin = scene.skinBindings.find(prim.GetPath().GetString());
-        if (!extractMesh(UsdGeomMesh(prim),
-                         nodeId,
-                         scene,
-                         skin == scene.skinBindings.end() ? nullptr : &skin->second)) {
-            return false;
+        if (prim.IsA<UsdGeomMesh>()) {
+            const auto skin = scene.skinBindings.find(prim.GetPath().GetString());
+            if (!extractMesh(UsdGeomMesh(prim),
+                             nodeId,
+                             scene,
+                             skin == scene.skinBindings.end() ? nullptr : &skin->second)) {
+                return false;
+            }
+        } else {
+            extractAnalyticPrimitive(prim, nodeId, scene);
         }
     }
     return true;
@@ -1958,6 +2136,45 @@ packScene(const SceneData& scene, SceneBuffers& result)
         result.triangleCount += mesh.indices.size() / 3;
     }
 
+    for (size_t primitiveIndex = 0;
+         primitiveIndex < scene.analyticPrimitives.size();
+         ++primitiveIndex) {
+        const AnalyticPrimitiveData& primitive =
+          scene.analyticPrimitives[primitiveIndex];
+        const uint32_t meshId =
+          static_cast<uint32_t>(scene.meshes.size() + primitiveIndex + 1);
+        uint32_t nameLength = 0;
+        const uint32_t nameOffset =
+          appendString(data, primitive.name, nameLength);
+        const uint32_t record = commands.begin(Command::AnalyticPrimitive);
+        commands.buffer.u32(meshId);
+        commands.buffer.u32(primitive.nodeIds.front());
+        commands.buffer.u32(static_cast<uint32_t>(primitive.type));
+        commands.buffer.u32(primitive.materialId);
+        commands.buffer.u32(nameOffset);
+        commands.buffer.u32(nameLength);
+        commands.buffer.u32(primitive.flags);
+        commands.buffer.u32(static_cast<uint32_t>(primitive.axis));
+        commands.buffer.f32(primitive.sizeOrRadius);
+        commands.buffer.f32(primitive.height);
+        commands.buffer.u32(primitive.tessellation);
+        commands.end(record);
+
+        for (size_t placement = 1; placement < primitive.nodeIds.size(); ++placement) {
+            const std::string instanceName = primitive.name + " instance";
+            uint32_t instanceNameLength = 0;
+            const uint32_t instanceNameOffset =
+              appendString(data, instanceName, instanceNameLength);
+            const uint32_t instanceRecord = commands.begin(Command::Instance);
+            commands.buffer.u32(meshId);
+            commands.buffer.u32(primitive.nodeIds[placement]);
+            commands.buffer.u32(instanceNameOffset);
+            commands.buffer.u32(instanceNameLength);
+            commands.end(instanceRecord);
+            ++result.instanceCount;
+        }
+    }
+
     for (size_t nodeIndex = 0; nodeIndex < scene.nodes.size(); ++nodeIndex) {
         const NodeAnimation& animation = scene.nodes[nodeIndex].animation;
         emitAnimation(commands,
@@ -1995,6 +2212,8 @@ packScene(const SceneData& scene, SceneBuffers& result)
     result.commands = commands.finish();
     result.data = std::move(data.bytes);
     result.nodeCount = static_cast<uint32_t>(scene.nodes.size());
+    result.analyticPrimitiveCount =
+      static_cast<uint32_t>(scene.analyticPrimitives.size());
     result.materialCount =
       static_cast<uint32_t>(scene.materials.empty() ? 0 : scene.materials.size() - 1);
     return true;

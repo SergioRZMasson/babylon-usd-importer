@@ -236,6 +236,7 @@ async function runLoad(generation, bytes, fileName, files, sourceByteLength) {
             ['Babylon materialize', `${timings.materializeMs.toFixed(0)} ms`],
             ['Total', `${totalMs.toFixed(0)} ms`],
             ['Source meshes', statistics.meshes.toLocaleString()],
+            ['Analytic primitives', statistics.analyticPrimitives.toLocaleString()],
             ['Native instances', statistics.instances.toLocaleString()],
             ['Unique vertices', statistics.vertices.toLocaleString()],
             ['Unique triangles', statistics.triangles.toLocaleString()],

@@ -35,6 +35,7 @@ export interface ImportTimings {
 export interface SceneStatistics {
     nodes: number;
     meshes: number;
+    analyticPrimitives: number;
     instances: number;
     materials: number;
     vertices: number;

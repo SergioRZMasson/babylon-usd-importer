@@ -80,6 +80,7 @@ public:
     double packingMs() const { return m_packingMs; }
     uint32_t nodeCount() const { return m_nodeCount; }
     uint32_t meshCount() const { return m_meshCount; }
+    uint32_t analyticPrimitiveCount() const { return m_analyticPrimitiveCount; }
     uint32_t instanceCount() const { return m_instanceCount; }
     uint32_t materialCount() const { return m_materialCount; }
     double vertexCount() const { return static_cast<double>(m_vertexCount); }
@@ -101,6 +102,7 @@ public:
         m_packingMs = buffers.packingMs;
         m_nodeCount = buffers.nodeCount;
         m_meshCount = buffers.meshCount;
+        m_analyticPrimitiveCount = buffers.analyticPrimitiveCount;
         m_instanceCount = buffers.instanceCount;
         m_materialCount = buffers.materialCount;
         m_vertexCount = buffers.vertexCount;
@@ -119,6 +121,7 @@ private:
     double m_packingMs = 0.0;
     uint32_t m_nodeCount = 0;
     uint32_t m_meshCount = 0;
+    uint32_t m_analyticPrimitiveCount = 0;
     uint32_t m_instanceCount = 0;
     uint32_t m_materialCount = 0;
     uint64_t m_vertexCount = 0;
@@ -224,6 +227,7 @@ EMSCRIPTEN_BINDINGS(openusd_babylon_direct)
       .function("packingMs", &DirectResult::packingMs)
       .function("nodeCount", &DirectResult::nodeCount)
       .function("meshCount", &DirectResult::meshCount)
+      .function("analyticPrimitiveCount", &DirectResult::analyticPrimitiveCount)
       .function("instanceCount", &DirectResult::instanceCount)
       .function("materialCount", &DirectResult::materialCount)
       .function("vertexCount", &DirectResult::vertexCount)

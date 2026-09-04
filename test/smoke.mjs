@@ -13,20 +13,30 @@ const module = await createModule({
 });
 
 module.FS.mkdir("/test");
-module.FS.writeFile("/test/cube.usda", await readFile(resolve(root, "demo", "assets", "cube.usda")));
 
-const result = module.extract("/test/cube.usda");
-try {
+async function extract(name) {
+    const sourcePath = resolve(root, "demo", "assets", name);
+    const virtualPath = `/test/${name}`;
+    module.FS.writeFile(virtualPath, await readFile(sourcePath));
+    const result = module.extract(virtualPath);
     if (!result.ok()) {
-        throw new Error(result.error());
+        const error = result.error();
+        result.delete();
+        module.FS.unlink(virtualPath);
+        throw new Error(error);
     }
+    return { result, virtualPath };
+}
 
+const cube = await extract("cube.usda");
+try {
+    const result = cube.result;
     const commands = module.HEAPU8.subarray(
         result.commandPtr(),
         result.commandPtr() + result.commandSize(),
     );
     const header = new DataView(commands.buffer, commands.byteOffset, commands.byteLength);
-    if (header.getUint32(0, true) !== 0x42445355 || header.getUint16(4, true) !== 3) {
+    if (header.getUint32(0, true) !== 0x42445355 || header.getUint16(4, true) !== 4) {
         throw new Error("Unexpected Babylon USD command protocol header.");
     }
     if (result.meshCount() !== 2 || result.vertexCount() !== 28 || result.triangleCount() !== 14) {
@@ -42,7 +52,23 @@ try {
             `${result.totalMs().toFixed(1)} ms`,
     );
 } finally {
-    result.delete();
-    module.FS.unlink("/test/cube.usda");
+    cube.result.delete();
+    module.FS.unlink(cube.virtualPath);
+}
+
+const analytic = await extract("analytic.usda");
+try {
+    if (
+        analytic.result.meshCount() !== 0 ||
+        analytic.result.analyticPrimitiveCount() !== 4
+    ) {
+        throw new Error(
+            `Unexpected analytic result: ${analytic.result.meshCount()} meshes, ` +
+                `${analytic.result.analyticPrimitiveCount()} analytic primitives.`,
+        );
+    }
+} finally {
+    analytic.result.delete();
+    module.FS.unlink(analytic.virtualPath);
     module.FS.rmdir("/test");
 }
