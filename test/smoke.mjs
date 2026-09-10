@@ -38,7 +38,7 @@ function commandRecords(result) {
     const view = new DataView(commands.buffer);
     if (
         view.getUint32(0, true) !== 0x42445355 ||
-        view.getUint16(4, true) !== 5
+        view.getUint16(4, true) !== 4
     ) {
         throw new Error("Unexpected Babylon USD command protocol header.");
     }

@@ -163,7 +163,7 @@ Run the Node/Emscripten protocol smoke test:
 node test/smoke.mjs
 ```
 
-The current little-endian command protocol is version 5. Texture payloads are 48 bytes
+The current little-endian command protocol is version 4. Texture payloads are 48 bytes
 (ten existing `u32` fields, source color space, and an offset to float4 scale plus float4
 bias). Material payloads are 96 bytes and carry seven texture IDs followed by seven output
 channels in base, opacity, normal, metallic, roughness, occlusion, emissive order.

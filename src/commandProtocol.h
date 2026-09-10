@@ -5,7 +5,7 @@
 namespace babylon::usd_importer {
 
 constexpr uint32_t kCommandMagic = 0x42445355; // "USDB"
-constexpr uint16_t kProtocolVersion = 5;
+constexpr uint16_t kProtocolVersion = 4;
 constexpr uint32_t kMissingOffset = 0xffffffffu;
 
 enum class Command : uint16_t
