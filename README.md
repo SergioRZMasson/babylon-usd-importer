@@ -101,7 +101,10 @@ relationships.
 - Material binding subsets.
 - Exact vertex welding and indexed geometry.
 - `UsdPreviewSurface`, `UsdUVTexture`, `UsdTransform2d`, and primvar readers.
-- PBR base color, opacity, metallic/roughness packing, normal, emissive, and UV transforms.
+- PBR base color, opacity, normal, metallic, roughness, occlusion, and emissive textures.
+- Shared packed metallic/roughness/occlusion images and separately authored scalar maps.
+- `UsdUVTexture` output-channel selection, source color space, float4 scale/bias, and UV
+  transforms.
 - Shared source geometry and Babylon instances.
 - Up to eight skinning influences.
 - Skeletons, node animation, and skeletal animation.
@@ -110,9 +113,10 @@ relationships.
 
 - Polygon triangulation is a convex fan; concave n-gons need a more robust triangulator.
 - Only one UV stream is currently emitted per mesh.
-- Separately authored metallic and roughness textures are not repacked yet.
 - MaterialX, MDL, OpenPBR, and other surface models fall back explicitly.
 - Browser-unsupported image formats require native transcoding.
+- Only `UsdUVTexture` image nodes and `UsdTransform2d`/`UsdPrimvarReader_float2` UV networks
+  are translated; unsupported shader nodes are reported and ignored.
 - Blend shapes, point instancers, cameras, lights, physics, and runtime
   variant switching are not yet represented by the command protocol.
 - Analytic primitive dimensions are currently sampled at the default time.
@@ -158,6 +162,11 @@ Run the Node/Emscripten protocol smoke test:
 ```sh
 node test/smoke.mjs
 ```
+
+The current little-endian command protocol is version 5. Texture payloads are 48 bytes
+(ten existing `u32` fields, source color space, and an offset to float4 scale plus float4
+bias). Material payloads are 96 bytes and carry seven texture IDs followed by seven output
+channels in base, opacity, normal, metallic, roughness, occlusion, emissive order.
 
 ## Repository layout
 

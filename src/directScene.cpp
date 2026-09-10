@@ -167,13 +167,17 @@ public:
 struct TextureData
 {
     SdfAssetPath asset;
+    SdfPath sourceShader;
     std::string name;
     TfToken channel;
+    TfToken sourceColorSpace = TfToken("auto");
     TfToken wrapS = TfToken("repeat");
     TfToken wrapT = TfToken("repeat");
-    GfVec2f scale = GfVec2f(1.0f);
-    GfVec2f translation = GfVec2f(0.0f);
+    GfVec2f uvScale = GfVec2f(1.0f);
+    GfVec2f uvTranslation = GfVec2f(0.0f);
     float rotation = 0.0f;
+    GfVec4f valueScale = GfVec4f(1.0f);
+    GfVec4f valueBias = GfVec4f(0.0f);
     int uvIndex = 0;
     TfToken uvName = TfToken("st");
 
@@ -195,12 +199,17 @@ struct MaterialData
     TextureData baseTexture;
     TextureData opacityTexture;
     TextureData normalTexture;
-    TextureData ormTexture;
+    TextureData metallicTexture;
+    TextureData roughnessTexture;
+    TextureData occlusionTexture;
     TextureData emissiveTexture;
+    uint32_t baseChannel = kMissingOffset;
     uint32_t opacityChannel = kMissingOffset;
-    uint32_t roughnessChannel = kMissingOffset;
+    uint32_t normalChannel = kMissingOffset;
     uint32_t metallicChannel = kMissingOffset;
+    uint32_t roughnessChannel = kMissingOffset;
     uint32_t occlusionChannel = kMissingOffset;
+    uint32_t emissiveChannel = kMissingOffset;
 };
 
 struct NodeAnimation
@@ -413,8 +422,8 @@ readUvConnection(const UsdShadeShader& textureShader, TextureData& texture)
     TfToken sourceId;
     source.GetShaderId(&sourceId);
     if (sourceId == TfToken("UsdTransform2d")) {
-        getInputValue(source, "scale", texture.scale);
-        getInputValue(source, "translation", texture.translation);
+        getInputValue(source, "scale", texture.uvScale);
+        getInputValue(source, "translation", texture.uvTranslation);
         float rotationDegrees = 0.0f;
         if (getInputValue(source, "rotation", rotationDegrees)) {
             texture.rotation =
@@ -433,7 +442,30 @@ readUvConnection(const UsdShadeShader& textureShader, TextureData& texture)
         }
         texture.uvName = varname;
         texture.uvIndex = 0;
+    } else {
+        TF_WARN("Ignoring unsupported UV source shader '%s' at <%s>.",
+                sourceId.GetText(),
+                source.GetPath().GetText());
     }
+}
+
+TfToken
+normalizedSourceColorSpace(const TfToken& authored)
+{
+    std::string normalized = TfStringToLower(authored.GetString());
+    normalized.erase(std::remove_if(normalized.begin(),
+                                    normalized.end(),
+                                    [](char value) {
+                                        return value == '-' || value == '_';
+                                    }),
+                     normalized.end());
+    if (normalized == "raw") {
+        return TfToken("raw");
+    }
+    if (normalized == "srgb") {
+        return TfToken("sRGB");
+    }
+    return TfToken("auto");
 }
 
 TextureData
@@ -448,32 +480,27 @@ readTexture(const UsdShadeInput& materialInput)
     TfToken shaderId;
     shader.GetShaderId(&shaderId);
     if (shaderId != TfToken("UsdUVTexture")) {
+        TF_WARN("Ignoring texture connection from unsupported shader '%s' at <%s>.",
+                shaderId.GetText(),
+                shader.GetPath().GetText());
         return result;
     }
     if (!getInputValue(shader, "file", result.asset) || result.asset.GetAssetPath().empty()) {
         return {};
     }
+    result.sourceShader = shader.GetPath();
     result.name = TfGetBaseName(result.asset.GetAssetPath());
     result.channel = outputName;
+    TfToken sourceColorSpace;
+    if (getTokenInput(shader, "sourceColorSpace", sourceColorSpace)) {
+        result.sourceColorSpace = normalizedSourceColorSpace(sourceColorSpace);
+    }
+    getInputValue(shader, "scale", result.valueScale);
+    getInputValue(shader, "bias", result.valueBias);
     getTokenInput(shader, "wrapS", result.wrapS);
     getTokenInput(shader, "wrapT", result.wrapT);
     readUvConnection(shader, result);
     return result;
-}
-
-bool
-sameTexture(const TextureData& left, const TextureData& right)
-{
-    if (!left || !right) {
-        return false;
-    }
-    const std::string leftPath =
-      left.asset.GetResolvedPath().empty() ? left.asset.GetAssetPath()
-                                           : left.asset.GetResolvedPath();
-    const std::string rightPath =
-      right.asset.GetResolvedPath().empty() ? right.asset.GetAssetPath()
-                                            : right.asset.GetResolvedPath();
-    return leftPath == rightPath;
 }
 
 uint32_t
@@ -491,7 +518,10 @@ textureChannel(const TfToken& channel)
     if (channel == TfToken("a")) {
         return 3;
     }
-    return 4;
+    if (channel == TfToken("rgb")) {
+        return 4;
+    }
+    return kMissingOffset;
 }
 
 std::optional<MaterialData>
@@ -518,65 +548,66 @@ readMaterial(const UsdShadeMaterial& material)
     getInputValue(shader, "roughness", result.roughness);
     getInputValue(shader, "opacity", result.opacity);
     getInputValue(shader, "opacityThreshold", result.alphaCutoff);
-    const float authoredOpacity = result.opacity;
 
     const UsdShadeInput baseInput = shader.GetInput(TfToken("diffuseColor"));
     const UsdShadeInput opacityInput = shader.GetInput(TfToken("opacity"));
     const UsdShadeInput metallicInput = shader.GetInput(TfToken("metallic"));
     const UsdShadeInput roughnessInput = shader.GetInput(TfToken("roughness"));
     const UsdShadeInput occlusionInput = shader.GetInput(TfToken("occlusion"));
-    result.baseTexture = readTexture(baseInput);
-    result.normalTexture = readTexture(shader.GetInput(TfToken("normal")));
-    result.emissiveTexture = readTexture(shader.GetInput(TfToken("emissiveColor")));
 
-    result.opacityTexture = readTexture(opacityInput);
-    if (result.opacityTexture) {
-        result.opacityChannel = textureChannel(result.opacityTexture.channel);
-        if (result.opacityChannel == 3) {
-            result.opacity = std::min(result.opacity, 0.999f);
-        } else {
-            TF_WARN("Ignoring opacity texture output '%s' on material <%s>; Babylon requires "
-                    "this baseline path to provide opacity in the alpha channel.",
-                    result.opacityTexture.channel.GetText(),
-                    material.GetPath().GetText());
-            result.opacityTexture = {};
-            result.opacityChannel = kMissingOffset;
+    auto readBinding = [&](const UsdShadeInput& input,
+                           TextureData& texture,
+                           uint32_t& channel,
+                           const char* slot) {
+        texture = readTexture(input);
+        if (!texture) {
+            return false;
         }
-    }
+        channel = textureChannel(texture.channel);
+        if (channel != kMissingOffset) {
+            return true;
+        }
+        TF_WARN("Ignoring %s texture on material <%s>: unsupported output '%s'.",
+                slot,
+                material.GetPath().GetText(),
+                texture.channel.GetText());
+        texture = {};
+        return false;
+    };
 
-    const TextureData metallicTexture = readTexture(metallicInput);
-    const TextureData roughnessTexture = readTexture(roughnessInput);
-    const TextureData occlusionTexture = readTexture(occlusionInput);
-    if (sameTexture(metallicTexture, roughnessTexture)) {
-        const uint32_t metallicChannel = textureChannel(metallicTexture.channel);
-        const uint32_t roughnessChannel = textureChannel(roughnessTexture.channel);
-        const bool supportedMetallic = metallicChannel == 0 || metallicChannel == 2;
-        const bool supportedRoughness = roughnessChannel == 1 || roughnessChannel == 3;
-        if (supportedMetallic && supportedRoughness) {
-            result.ormTexture = metallicTexture;
-            result.metallicChannel = metallicChannel;
-            result.roughnessChannel = roughnessChannel;
-            if (sameTexture(result.ormTexture, occlusionTexture) &&
-                textureChannel(occlusionTexture.channel) == 0) {
-                result.occlusionChannel = 0;
-            }
-        } else {
-            TF_WARN("Ignoring unsupported metallic/roughness channel layout on material <%s>.",
-                    material.GetPath().GetText());
-        }
-    } else if (metallicTexture || roughnessTexture) {
-        TF_WARN("Ignoring separately authored metallic and roughness textures on material <%s>; "
-                "the native baseline currently requires a shared packed texture.",
-                material.GetPath().GetText());
-    }
-    if (occlusionTexture && result.occlusionChannel == kMissingOffset) {
-        TF_WARN("Ignoring separate occlusion texture on material <%s> in the native direct "
-                "baseline.",
-                material.GetPath().GetText());
-    }
+    readBinding(baseInput,
+                result.baseTexture,
+                result.baseChannel,
+                "base-color");
+    readBinding(opacityInput,
+                result.opacityTexture,
+                result.opacityChannel,
+                "opacity");
+    readBinding(shader.GetInput(TfToken("normal")),
+                result.normalTexture,
+                result.normalChannel,
+                "normal");
+    readBinding(metallicInput,
+                result.metallicTexture,
+                result.metallicChannel,
+                "metallic");
+    readBinding(roughnessInput,
+                result.roughnessTexture,
+                result.roughnessChannel,
+                "roughness");
+    readBinding(occlusionInput,
+                result.occlusionTexture,
+                result.occlusionChannel,
+                "occlusion");
+    readBinding(shader.GetInput(TfToken("emissiveColor")),
+                result.emissiveTexture,
+                result.emissiveChannel,
+                "emissive");
 
     TfToken materialUv;
-    auto validateUv = [&](TextureData& texture, const char* slot) {
+    auto validateUv = [&](TextureData& texture,
+                          uint32_t& channel,
+                          const char* slot) {
         if (!texture) {
             return true;
         }
@@ -594,20 +625,30 @@ readMaterial(const UsdShadeMaterial& material)
                 texture.uvName.GetText(),
                 materialUv.GetText());
         texture = {};
+        channel = kMissingOffset;
         return false;
     };
-    validateUv(result.baseTexture, "base-color");
-    if (!validateUv(result.opacityTexture, "opacity")) {
-        result.opacityChannel = kMissingOffset;
-        result.opacity = authoredOpacity;
-    }
-    validateUv(result.normalTexture, "normal");
-    if (!validateUv(result.ormTexture, "metallic-roughness")) {
-        result.roughnessChannel = kMissingOffset;
-        result.metallicChannel = kMissingOffset;
-        result.occlusionChannel = kMissingOffset;
-    }
-    validateUv(result.emissiveTexture, "emissive");
+    validateUv(result.baseTexture,
+               result.baseChannel,
+               "base-color");
+    validateUv(result.opacityTexture,
+               result.opacityChannel,
+               "opacity");
+    validateUv(result.normalTexture,
+               result.normalChannel,
+               "normal");
+    validateUv(result.metallicTexture,
+               result.metallicChannel,
+               "metallic");
+    validateUv(result.roughnessTexture,
+               result.roughnessChannel,
+               "roughness");
+    validateUv(result.occlusionTexture,
+               result.occlusionChannel,
+               "occlusion");
+    validateUv(result.emissiveTexture,
+               result.emissiveChannel,
+               "emissive");
 
     result.unlit = TfStringToLower(shaderId.GetString()).find("unlit") != std::string::npos;
     return result;
@@ -694,6 +735,7 @@ readUvs(const UsdGeomMesh& mesh, const TfToken& requestedName)
         TF_WARN("Mesh <%s> does not provide requested UV primvar '%s'.",
                 mesh.GetPath().GetText(),
                 requestedName.GetText());
+        return {};
     }
     static const std::array<TfToken, 3> preferred = {
         TfToken("st"), TfToken("uv"), TfToken("UVMap")
@@ -725,11 +767,13 @@ materialUvName(const SceneData& scene,
         }
         visited[materialId] = true;
         const MaterialData& material = scene.materials[materialId];
-        const std::array<const TextureData*, 5> textures = {
+        const std::array<const TextureData*, 7> textures = {
             &material.baseTexture,
             &material.opacityTexture,
             &material.normalTexture,
-            &material.ormTexture,
+            &material.metallicTexture,
+            &material.roughnessTexture,
+            &material.occlusionTexture,
             &material.emissiveTexture,
         };
         for (const TextureData* texture : textures) {
@@ -1416,6 +1460,12 @@ extractMesh(const UsdGeomMesh& usdMesh,
         return false;
     }
     const PrimvarData<GfVec2f> uvData = readUvs(usdMesh, uvName);
+    if (!uvName.IsEmpty() && !uvData) {
+        TF_WARN("Cannot emit mesh <%s>: its material textures require UV primvar '%s'.",
+                usdMesh.GetPath().GetText(),
+                uvName.GetText());
+        return false;
+    }
     const UsdGeomGprim gprim(usdMesh.GetPrim());
     const PrimvarData<GfVec3f> colorData =
       readAuthoredPrimvar<GfVec3f>(gprim.GetDisplayColorPrimvar());
@@ -1731,15 +1781,35 @@ wrapMode(const TfToken& mode)
     return mode == TfToken("repeat") ? 1 : 0;
 }
 
+TextureSourceColorSpace
+sourceColorSpace(const TfToken& value)
+{
+    if (value == TfToken("raw")) {
+        return TextureSourceColorSpace::Raw;
+    }
+    if (value == TfToken("sRGB")) {
+        return TextureSourceColorSpace::SRGB;
+    }
+    return TextureSourceColorSpace::Auto;
+}
+
 int32_t
 emitTexture(CommandWriter& commands,
             BufferWriter& data,
             const TextureData& texture,
-            uint32_t textureId,
+            uint32_t& nextTextureId,
+            std::unordered_map<std::string, uint32_t>& textureCache,
             std::unordered_map<std::string, std::pair<uint32_t, uint32_t>>& imageCache)
 {
     if (!texture) {
         return -1;
+    }
+    const std::string sourceKey = texture.sourceShader.GetString();
+    if (!sourceKey.empty()) {
+        const auto existing = textureCache.find(sourceKey);
+        if (existing != textureCache.end()) {
+            return static_cast<int32_t>(existing->second);
+        }
     }
     const std::string resolved = resolvedTexturePath(texture);
     if (resolved.empty()) {
@@ -1776,12 +1846,20 @@ emitTexture(CommandWriter& commands,
       appendString(data, texture.name.empty() ? TfGetBaseName(resolved) : texture.name, nameLength);
     data.align();
     const uint32_t transformOffset = data.size();
-    data.f32(texture.scale[0]);
-    data.f32(texture.scale[1]);
-    data.f32(texture.translation[0]);
-    data.f32(texture.translation[1]);
+    data.f32(texture.uvScale[0]);
+    data.f32(texture.uvScale[1]);
+    data.f32(texture.uvTranslation[0]);
+    data.f32(texture.uvTranslation[1]);
     data.f32(texture.rotation);
+    const uint32_t valueTransformOffset = data.size();
+    for (int index = 0; index < 4; ++index) {
+        data.f32(texture.valueScale[index]);
+    }
+    for (int index = 0; index < 4; ++index) {
+        data.f32(texture.valueBias[index]);
+    }
 
+    const uint32_t textureId = nextTextureId++;
     const uint32_t record = commands.begin(Command::Texture);
     commands.buffer.u32(textureId);
     commands.buffer.u32(nameOffset);
@@ -1793,7 +1871,12 @@ emitTexture(CommandWriter& commands,
     commands.buffer.u32(transformOffset);
     commands.buffer.u32(wrapMode(texture.wrapS));
     commands.buffer.u32(wrapMode(texture.wrapT));
+    commands.buffer.u32(static_cast<uint32_t>(sourceColorSpace(texture.sourceColorSpace)));
+    commands.buffer.u32(valueTransformOffset);
     commands.end(record);
+    if (!sourceKey.empty()) {
+        textureCache.emplace(sourceKey, textureId);
+    }
     return static_cast<int32_t>(textureId);
 }
 
@@ -1801,82 +1884,78 @@ void
 emitMaterials(CommandWriter& commands, BufferWriter& data, const SceneData& scene)
 {
     uint32_t nextTextureId = 1;
+    std::unordered_map<std::string, uint32_t> textureCache;
     std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> imageCache;
     for (size_t materialIndex = 0; materialIndex < scene.materials.size();
          ++materialIndex) {
         const MaterialData& material = scene.materials[materialIndex];
-        const int32_t baseTexture =
-          emitTexture(commands,
-                      data,
-                      material.baseTexture,
-                      nextTextureId,
-                      imageCache);
-        nextTextureId += baseTexture >= 0 ? 1 : 0;
-        const int32_t opacityTexture =
-          emitTexture(commands,
-                      data,
-                      material.opacityTexture,
-                      nextTextureId,
-                      imageCache);
-        nextTextureId += opacityTexture >= 0 ? 1 : 0;
-        const int32_t normalTexture =
-          emitTexture(commands,
-                      data,
-                      material.normalTexture,
-                      nextTextureId,
-                      imageCache);
-        nextTextureId += normalTexture >= 0 ? 1 : 0;
-        const int32_t ormTexture =
-          emitTexture(commands,
-                      data,
-                      material.ormTexture,
-                      nextTextureId,
-                      imageCache);
-        nextTextureId += ormTexture >= 0 ? 1 : 0;
-        const int32_t emissiveTexture =
-          emitTexture(commands,
-                      data,
-                      material.emissiveTexture,
-                      nextTextureId,
-                      imageCache);
-        nextTextureId += emissiveTexture >= 0 ? 1 : 0;
+        const std::array<const TextureData*, 7> textureData = {
+            &material.baseTexture,
+            &material.opacityTexture,
+            &material.normalTexture,
+            &material.metallicTexture,
+            &material.roughnessTexture,
+            &material.occlusionTexture,
+            &material.emissiveTexture,
+        };
+        std::array<int32_t, 7> textureIds;
+        for (size_t index = 0; index < textureData.size(); ++index) {
+            textureIds[index] = emitTexture(commands,
+                                            data,
+                                            *textureData[index],
+                                            nextTextureId,
+                                            textureCache,
+                                            imageCache);
+        }
+        const std::array<uint32_t, 7> authoredChannels = {
+            material.baseChannel,
+            material.opacityChannel,
+            material.normalChannel,
+            material.metallicChannel,
+            material.roughnessChannel,
+            material.occlusionChannel,
+            material.emissiveChannel,
+        };
 
         data.align();
+        const bool hasBaseTexture = textureIds[0] >= 0;
+        const bool hasOpacityTexture = textureIds[1] >= 0;
+        const bool hasMetallicTexture = textureIds[3] >= 0;
+        const bool hasRoughnessTexture = textureIds[4] >= 0;
+        const bool hasEmissiveTexture = textureIds[6] >= 0;
         const uint32_t baseOffset = data.size();
-        data.f32(material.baseColor[0]);
-        data.f32(material.baseColor[1]);
-        data.f32(material.baseColor[2]);
-        data.f32(material.opacity);
+        data.f32(hasBaseTexture ? 1.0f : material.baseColor[0]);
+        data.f32(hasBaseTexture ? 1.0f : material.baseColor[1]);
+        data.f32(hasBaseTexture ? 1.0f : material.baseColor[2]);
+        data.f32(hasOpacityTexture ? 1.0f : material.opacity);
         const uint32_t emissiveOffset = data.size();
-        data.f32(material.emissive[0]);
-        data.f32(material.emissive[1]);
-        data.f32(material.emissive[2]);
+        data.f32(hasEmissiveTexture ? 1.0f : material.emissive[0]);
+        data.f32(hasEmissiveTexture ? 1.0f : material.emissive[1]);
+        data.f32(hasEmissiveTexture ? 1.0f : material.emissive[2]);
         uint32_t nameLength = 0;
         const uint32_t nameOffset = appendString(data, material.name, nameLength);
 
         uint32_t flags = material.unlit ? MaterialUnlit : 0;
         flags |= material.doubleSided ? MaterialDoubleSided : 0;
-        flags |= material.opacity < 0.999f || opacityTexture >= 0 ? MaterialAlphaBlend : 0;
+        flags |= material.opacity < 0.999f || hasOpacityTexture ? MaterialAlphaBlend : 0;
         const uint32_t record = commands.begin(Command::Material);
         commands.buffer.u32(static_cast<uint32_t>(materialIndex));
         commands.buffer.u32(nameOffset);
         commands.buffer.u32(nameLength);
         commands.buffer.u32(baseOffset);
         commands.buffer.u32(emissiveOffset);
-        commands.buffer.f32(material.metallic);
-        commands.buffer.f32(material.roughness);
+        commands.buffer.f32(hasMetallicTexture ? 1.0f : material.metallic);
+        commands.buffer.f32(hasRoughnessTexture ? 1.0f : material.roughness);
         commands.buffer.f32(material.normalScale);
         commands.buffer.f32(material.alphaCutoff);
         commands.buffer.u32(flags);
-        commands.buffer.u32(static_cast<uint32_t>(baseTexture));
-        commands.buffer.u32(static_cast<uint32_t>(opacityTexture));
-        commands.buffer.u32(static_cast<uint32_t>(normalTexture));
-        commands.buffer.u32(static_cast<uint32_t>(ormTexture));
-        commands.buffer.u32(static_cast<uint32_t>(emissiveTexture));
-        commands.buffer.u32(material.opacityChannel);
-        commands.buffer.u32(material.roughnessChannel);
-        commands.buffer.u32(material.metallicChannel);
-        commands.buffer.u32(material.occlusionChannel);
+        for (const int32_t textureId : textureIds) {
+            commands.buffer.u32(static_cast<uint32_t>(textureId));
+        }
+        for (size_t index = 0; index < textureIds.size(); ++index) {
+            commands.buffer.u32(textureIds[index] >= 0 ? authoredChannels[index]
+                                                       : kMissingOffset);
+        }
         commands.end(record);
     }
 }

@@ -5,7 +5,7 @@
 namespace babylon::usd_importer {
 
 constexpr uint32_t kCommandMagic = 0x42445355; // "USDB"
-constexpr uint16_t kProtocolVersion = 4;
+constexpr uint16_t kProtocolVersion = 5;
 constexpr uint32_t kMissingOffset = 0xffffffffu;
 
 enum class Command : uint16_t
@@ -49,6 +49,22 @@ enum class AnimationProperty : uint32_t
     RotationQuaternion = 1,
     Scaling = 2,
     Matrix = 3,
+};
+
+enum class TextureSourceColorSpace : uint32_t
+{
+    Auto = 0,
+    Raw = 1,
+    SRGB = 2,
+};
+
+enum class TextureOutputChannel : uint32_t
+{
+    R = 0,
+    G = 1,
+    B = 2,
+    A = 3,
+    RGB = 4,
 };
 
 enum MaterialFlags : uint32_t

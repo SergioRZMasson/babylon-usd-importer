@@ -68,10 +68,13 @@ Call `dispose()` when the loader is no longer needed.
 ## Runtime model
 
 The versioned little-endian protocol validates command lengths, typed-array alignment, and
-raw-data ranges before creating Babylon objects. It supports transform hierarchies,
-materials, textures, optimized indexed geometry, subsets, instances, skeletons, skinning,
-node animation, skeletal animation, and native cube/sphere/cylinder/cone commands backed by
-Babylon procedural mesh builders.
+raw-data ranges before creating Babylon objects. Protocol v5 preserves seven independent
+UsdPreviewSurface texture bindings, output channels, `UsdUVTexture` source color space and
+float4 scale/bias transforms. Babylon's native PBR texture slots and TextureProcessor APIs
+materialize packed or separate metallic, roughness, occlusion, opacity, normal, base-color,
+and emissive maps. The protocol also supports optimized indexed geometry, subsets,
+instances, skeletons, skinning, animation, and native cube/sphere/cylinder/cone commands
+backed by Babylon procedural mesh builders.
 
 The package has a Babylon.js peer dependency and contains the generated OpenUSD Wasm module
 under `dist/wasm`.
