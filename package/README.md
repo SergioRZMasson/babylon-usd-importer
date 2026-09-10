@@ -68,7 +68,7 @@ Call `dispose()` when the loader is no longer needed.
 ## Runtime model
 
 The versioned little-endian protocol validates command lengths, typed-array alignment, and
-raw-data ranges before creating Babylon objects. Protocol v5 preserves seven independent
+raw-data ranges before creating Babylon objects. Protocol v4 preserves seven independent
 UsdPreviewSurface texture bindings, output channels, `UsdUVTexture` source color space and
 float4 scale/bias transforms. Babylon's native PBR texture slots and TextureProcessor APIs
 materialize packed or separate metallic, roughness, occlusion, opacity, normal, base-color,
