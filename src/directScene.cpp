@@ -39,9 +39,11 @@
 #include <pxr/usd/usdSkel/binding.h>
 #include <pxr/usd/usdSkel/cache.h>
 #include <pxr/usd/usdSkel/root.h>
+#include <pxr/usd/usdSkel/skeleton.h>
 #include <pxr/usd/usdSkel/skeletonQuery.h>
 #include <pxr/usd/usdSkel/skinningQuery.h>
 #include <pxr/usd/usdSkel/topology.h>
+#include <pxr/usd/usdSkel/utils.h>
 
 #include <algorithm>
 #include <array>
@@ -280,6 +282,7 @@ struct SkeletonData
     VtTokenArray joints;
     VtIntArray parents;
     VtMatrix4dArray restTransforms;
+    VtMatrix4dArray bindTransforms;
     SkeletonAnimation animation;
 };
 
@@ -1180,6 +1183,17 @@ registerSkeleton(SceneData& scene, const UsdSkelSkeletonQuery& query)
     if (skeleton.restTransforms.size() != skeleton.joints.size()) {
         skeleton.restTransforms.assign(skeleton.joints.size(), GfMatrix4d(1.0));
     }
+    VtMatrix4dArray skeletonBindTransforms;
+    if (!query.GetSkeleton().GetBindTransformsAttr().Get(&skeletonBindTransforms) ||
+        skeletonBindTransforms.size() != skeleton.joints.size()) {
+        skeleton.bindTransforms = skeleton.restTransforms;
+    } else {
+        skeleton.bindTransforms.resize(skeleton.joints.size());
+        if (!UsdSkelComputeJointLocalTransforms(
+              topology, skeletonBindTransforms, skeleton.bindTransforms)) {
+            skeleton.bindTransforms = skeleton.restTransforms;
+        }
+    }
 
     if (animQuery) {
         std::vector<double> times;
@@ -2047,15 +2061,14 @@ packScene(const SceneData& scene, SceneBuffers& result)
          ++skeletonIndex) {
         const SkeletonData& skeleton = scene.skeletons[skeletonIndex];
         boneIds[skeletonIndex].resize(skeleton.joints.size());
-        data.align();
-        const uint32_t jointsOffset = data.size();
         struct PendingJoint
         {
             uint32_t parent;
             uint32_t boneId;
             uint32_t nameOffset;
             uint32_t nameLength;
-            uint32_t matrixOffset;
+            uint32_t restMatrixOffset;
+            uint32_t bindMatrixOffset;
         };
         std::vector<PendingJoint> pending;
         pending.reserve(skeleton.joints.size());
@@ -2065,8 +2078,10 @@ packScene(const SceneData& scene, SceneBuffers& result)
             uint32_t nameLength = 0;
             const uint32_t nameOffset =
               appendString(data, skeleton.joints[jointIndex].GetString(), nameLength);
-            const uint32_t matrixOffset =
+            const uint32_t restMatrixOffset =
               appendMatrix(data, skeleton.restTransforms[jointIndex]);
+            const uint32_t bindMatrixOffset =
+              appendMatrix(data, skeleton.bindTransforms[jointIndex]);
             pending.push_back({
                 skeleton.parents[jointIndex] >= 0
                   ? static_cast<uint32_t>(skeleton.parents[jointIndex])
@@ -2074,7 +2089,8 @@ packScene(const SceneData& scene, SceneBuffers& result)
                 boneId,
                 nameOffset,
                 nameLength,
-                matrixOffset,
+                restMatrixOffset,
+                bindMatrixOffset,
             });
         }
         data.align();
@@ -2084,9 +2100,9 @@ packScene(const SceneData& scene, SceneBuffers& result)
             data.u32(joint.boneId);
             data.u32(joint.nameOffset);
             data.u32(joint.nameLength);
-            data.u32(joint.matrixOffset);
+            data.u32(joint.restMatrixOffset);
+            data.u32(joint.bindMatrixOffset);
         }
-        (void)jointsOffset;
         uint32_t nameLength = 0;
         const uint32_t nameOffset = appendString(data, skeleton.name, nameLength);
         const uint32_t record = commands.begin(Command::Skeleton);

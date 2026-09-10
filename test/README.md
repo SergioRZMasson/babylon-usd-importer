@@ -11,6 +11,7 @@ node test/smoke.mjs
 
 - full affine/shear transform preservation;
 - matrix animation;
+- distinct skeleton rest and bind poses;
 - instance-proxy geometry reuse;
 - analytic-gprim instance reuse;
 - explicit left-handed mesh orientation.
@@ -19,4 +20,4 @@ node test/smoke.mjs
 - texture source color space and float4 scale/bias serialization;
 - distinct sampling metadata for shader nodes that reference the same image asset.
 
-Private performance and skeleton assets are intentionally not committed.
+Private performance and repro assets are intentionally not committed.

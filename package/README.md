@@ -74,7 +74,8 @@ float4 scale/bias transforms. Babylon's native PBR texture slots and TextureProc
 materialize packed or separate metallic, roughness, occlusion, opacity, normal, base-color,
 and emissive maps. The protocol also supports optimized indexed geometry, subsets,
 instances, skeletons, skinning, animation, and native cube/sphere/cylinder/cone commands
-backed by Babylon procedural mesh builders.
+backed by Babylon procedural mesh builders. Skeleton joint records preserve separate local
+rest and bind matrices so animated joints retain their authored pivots.
 
 The package has a Babylon.js peer dependency and contains the generated OpenUSD Wasm module
 under `dist/wasm`.

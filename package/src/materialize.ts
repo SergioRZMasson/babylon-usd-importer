@@ -989,13 +989,13 @@ export async function materializeCommandBuffers(
                     assertRange(
                         dataBuffer,
                         jointsOffset,
-                        jointCount * 5,
+                        jointCount * 6,
                         4,
                         "skeleton joints",
                     );
                     const created: Bone[] = [];
                     for (let index = 0; index < jointCount; ++index) {
-                        const offset = jointsOffset + index * 20;
+                        const offset = jointsOffset + index * 24;
                         const parentIndex = jointView.getUint32(offset, true);
                         const boneId = jointView.getUint32(offset + 4, true);
                         const jointNameOffset = jointView.getUint32(
@@ -1006,8 +1006,12 @@ export async function materializeCommandBuffers(
                             offset + 12,
                             true,
                         );
-                        const matrixOffset = jointView.getUint32(
+                        const restMatrixOffset = jointView.getUint32(
                             offset + 16,
+                            true,
+                        );
+                        const bindMatrixOffset = jointView.getUint32(
+                            offset + 20,
                             true,
                         );
                         if (
@@ -1028,9 +1032,9 @@ export async function materializeCommandBuffers(
                             parentIndex === MISSING_OFFSET
                                 ? null
                                 : created[parentIndex],
-                            matrixAt(dataBuffer, matrixOffset),
-                            matrixAt(dataBuffer, matrixOffset),
-                            undefined,
+                            matrixAt(dataBuffer, restMatrixOffset),
+                            matrixAt(dataBuffer, restMatrixOffset),
+                            matrixAt(dataBuffer, bindMatrixOffset),
                             index,
                         );
                         created.push(bone);

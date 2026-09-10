@@ -114,6 +114,44 @@ try {
     module.FS.unlink(analytic.virtualPath);
 }
 
+const bindPosePath = "/test/bind-pose.usda";
+module.FS.writeFile(
+    bindPosePath,
+    await readFile(resolve(root, "test", "assets", "bind-pose.usda")),
+);
+const bindPoseResult = module.extract(bindPosePath);
+try {
+    if (!bindPoseResult.ok()) {
+        throw new Error(bindPoseResult.error());
+    }
+    const { view, records } = commandRecords(bindPoseResult);
+    const skeleton = records.find((record) => record.opcode === 5);
+    if (!skeleton || view.getUint32(skeleton.offset + 12, true) !== 2) {
+        throw new Error("Expected the bind-pose fixture to emit a two-joint skeleton.");
+    }
+    const data = module.HEAPU8.slice(
+        bindPoseResult.dataPtr(),
+        bindPoseResult.dataPtr() + bindPoseResult.dataSize(),
+    );
+    const dataView = new DataView(data.buffer);
+    const jointsOffset = view.getUint32(skeleton.offset + 16, true);
+    const rootRestOffset = dataView.getUint32(jointsOffset + 16, true);
+    const rootBindOffset = dataView.getUint32(jointsOffset + 20, true);
+    const childRestOffset = dataView.getUint32(jointsOffset + 40, true);
+    const childBindOffset = dataView.getUint32(jointsOffset + 44, true);
+    if (
+        Math.abs(dataView.getFloat32(rootRestOffset + 52, true) - 5) > 1e-6 ||
+        Math.abs(dataView.getFloat32(rootBindOffset + 52, true) - 2) > 1e-6 ||
+        Math.abs(dataView.getFloat32(childRestOffset + 48, true) - 3) > 1e-6 ||
+        Math.abs(dataView.getFloat32(childBindOffset + 48, true) - 3) > 1e-6
+    ) {
+        throw new Error("Skeleton rest and local bind transforms were not preserved.");
+    }
+} finally {
+    bindPoseResult.delete();
+    module.FS.unlink(bindPosePath);
+}
+
 const textureFixturePath = "/test/material-textures.usda";
 const textureImagePath = "/test/texture.png";
 module.FS.writeFile(
