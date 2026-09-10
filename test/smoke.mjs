@@ -54,6 +54,7 @@ function commandRecords(result) {
         [9, 32],
         [10, 44],
         [11, 12],
+        [12, 32],
     ]);
     const records = [];
     let offset = 16;
@@ -243,6 +244,110 @@ try {
 } finally {
     pointInstancerIdsResult.delete();
     module.FS.unlink(pointInstancerIdsPath);
+}
+
+const morphTargetsPath = "/test/morph-targets.usda";
+module.FS.writeFile(
+    morphTargetsPath,
+    await readFile(resolve(root, "test", "assets", "morph-targets.usda")),
+);
+const morphTargetsResult = module.extract(morphTargetsPath);
+try {
+    if (!morphTargetsResult.ok()) {
+        throw new Error(morphTargetsResult.error());
+    }
+    const { view, records } = commandRecords(morphTargetsResult);
+    const data = module.HEAPU8.slice(
+        morphTargetsResult.dataPtr(),
+        morphTargetsResult.dataPtr() + morphTargetsResult.dataSize(),
+    );
+    const dataView = new DataView(data.buffer);
+    const targets = new Map();
+    for (const record of records) {
+        if (record.opcode !== 12) {
+            continue;
+        }
+        const id = view.getUint32(record.offset, true);
+        const nameOffset = view.getUint32(record.offset + 8, true);
+        const nameLength = view.getUint32(record.offset + 12, true);
+        const positionsOffset = view.getUint32(record.offset + 20, true);
+        targets.set(id, {
+            name: new TextDecoder().decode(
+                data.subarray(nameOffset, nameOffset + nameLength),
+            ),
+            positions: new Float32Array(data.buffer, positionsOffset, 9),
+            normalsOffset: view.getUint32(record.offset + 24, true),
+        });
+    }
+    const smileHalf = [...targets.entries()].find(([, target]) =>
+        target.name.includes("inbetweens:half"),
+    );
+    const smile = [...targets.entries()].find(
+        ([, target]) =>
+            target.name === "Smile" &&
+            !target.name.includes("inbetweens:half"),
+    );
+    const blink = [...targets.entries()].find(
+        ([, target]) => target.name === "Blink",
+    );
+    if (
+        targets.size !== 3 ||
+        !smileHalf ||
+        !smile ||
+        !blink ||
+        Math.abs(smileHalf[1].positions[7] - 1.25) > 1e-6 ||
+        Math.abs(smile[1].positions[7] - 2) > 1e-6 ||
+        Math.abs(blink[1].positions[1] + 0.5) > 1e-6 ||
+        smileHalf[1].normalsOffset === 0xffffffff ||
+        smile[1].normalsOffset === 0xffffffff ||
+        blink[1].normalsOffset === 0xffffffff
+    ) {
+        throw new Error(
+            "Sparse primary or in-between morph target data was not preserved.",
+        );
+    }
+    const animations = records.filter(
+        (record) =>
+            record.opcode === 9 &&
+            view.getUint32(record.offset, true) === 2,
+    );
+    const influenceAt = (targetId, frame) => {
+        const animation = animations.find(
+            (record) => view.getUint32(record.offset + 4, true) === targetId,
+        );
+        if (!animation || view.getUint32(animation.offset + 28, true) !== 1) {
+            return Number.NaN;
+        }
+        const keyCount = view.getUint32(animation.offset + 16, true);
+        const timesOffset = view.getUint32(animation.offset + 20, true);
+        const frameIndex = Array.from(
+            new Float32Array(data.buffer, timesOffset, keyCount),
+        ).indexOf(frame);
+        if (frameIndex < 0) {
+            return Number.NaN;
+        }
+        return dataView.getFloat32(
+            view.getUint32(animation.offset + 24, true) + frameIndex * 4,
+            true,
+        );
+    };
+    if (
+        animations.length !== 3 ||
+        Math.abs(influenceAt(smileHalf[0], 12) - 1) > 1e-6 ||
+        Math.abs(influenceAt(smile[0], 12)) > 1e-6 ||
+        Math.abs(influenceAt(smile[0], 24) - 1) > 1e-6 ||
+        Math.abs(influenceAt(blink[0], 12) - 0.2) > 1e-6
+    ) {
+        throw new Error(
+            "Morph target order, in-between weights, or influence animation was not preserved: " +
+                `animations=${animations.length}, half=${influenceAt(smileHalf[0], 1)}, ` +
+                `smile12=${influenceAt(smile[0], 12)}, smile24=${influenceAt(smile[0], 24)}, ` +
+                `blink=${influenceAt(blink[0], 12)}.`,
+        );
+    }
+} finally {
+    morphTargetsResult.delete();
+    module.FS.unlink(morphTargetsPath);
 }
 
 const textureFixturePath = "/test/material-textures.usda";

@@ -109,6 +109,8 @@ relationships.
   batches backed by thin-instance matrix buffers.
 - Up to eight skinning influences.
 - Skeletons, node animation, and skeletal animation.
+- Sparse USD blend shapes, authored normal offsets, in-between shapes, and animated
+  blend-shape weights materialized through Babylon morph targets.
 
 ## Current limitations
 
@@ -119,8 +121,8 @@ relationships.
 - Only `UsdUVTexture` image nodes and `UsdTransform2d`/`UsdPrimvarReader_float2` UV networks
   are translated; unsupported shader nodes are reported and ignored.
 - Animated point-instancer attributes are currently sampled at their first authored frame.
-- Blend shapes, nested point instancers, cameras, lights, physics, and runtime variant
-  switching are not yet represented by the command protocol.
+- Nested point instancers, cameras, lights, physics, and runtime variant switching are not
+  yet represented by the command protocol.
 - Analytic primitive dimensions are currently sampled at the default time.
 - Babylon object construction runs on the main thread after worker extraction.
 
@@ -171,7 +173,9 @@ separate local rest and bind matrices. Texture payloads are 48 bytes
 bias). Material payloads are 96 bytes and carry seven texture IDs followed by seven output
 channels in base, opacity, normal, metallic, roughness, occlusion, emissive order. A
 12-byte thin-instance command references one source mesh and a contiguous array of
-row-major float4x4 transforms in the shared data buffer.
+row-major float4x4 transforms in the shared data buffer. A 32-byte morph-target command
+references full post-weld target positions, optional normals, and an initial influence;
+scalar animation records drive morph influences and preserve USD in-between interpolation.
 
 ## Repository layout
 

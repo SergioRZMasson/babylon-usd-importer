@@ -21,6 +21,7 @@ enum class Command : uint16_t
     Animation = 9,
     AnalyticPrimitive = 10,
     ThinInstances = 11,
+    MorphTarget = 12,
 };
 
 enum class AnalyticPrimitiveType : uint32_t
@@ -42,6 +43,7 @@ enum class AnimationTarget : uint32_t
 {
     Node = 0,
     Bone = 1,
+    MorphTarget = 2,
 };
 
 enum class AnimationProperty : uint32_t
@@ -50,6 +52,7 @@ enum class AnimationProperty : uint32_t
     RotationQuaternion = 1,
     Scaling = 2,
     Matrix = 3,
+    Influence = 4,
 };
 
 enum class TextureSourceColorSpace : uint32_t

@@ -38,7 +38,11 @@
 #include <pxr/usd/usdShade/shader.h>
 #include <pxr/usd/usdShade/tokens.h>
 #include <pxr/usd/usdSkel/animQuery.h>
+#include <pxr/usd/usdSkel/animMapper.h>
+#include <pxr/usd/usdSkel/animation.h>
 #include <pxr/usd/usdSkel/binding.h>
+#include <pxr/usd/usdSkel/bindingAPI.h>
+#include <pxr/usd/usdSkel/blendShapeQuery.h>
 #include <pxr/usd/usdSkel/cache.h>
 #include <pxr/usd/usdSkel/root.h>
 #include <pxr/usd/usdSkel/skeleton.h>
@@ -238,6 +242,31 @@ struct SubmeshData
     uint32_t indexCount = 0;
 };
 
+struct MorphTargetAnimation
+{
+    std::vector<float> times;
+    std::vector<float> influences;
+};
+
+struct MorphTargetData
+{
+    std::string name;
+    float influence = 0.0f;
+    std::vector<GfVec3f> pointOffsets;
+    std::vector<GfVec3f> normalOffsets;
+    std::vector<GfVec3f> positions;
+    std::vector<GfVec3f> normals;
+    MorphTargetAnimation animation;
+};
+
+struct SourceMorphTarget
+{
+    MorphTargetData target;
+    size_t subShapeIndex = 0;
+    std::vector<GfVec3f> pointOffsets;
+    std::vector<GfVec3f> normalOffsets;
+};
+
 using JointSet = std::array<uint16_t, kMaxInfluences>;
 using WeightSet = std::array<float, kMaxInfluences>;
 
@@ -254,8 +283,10 @@ struct MeshData
     std::vector<GfVec4f> colors;
     std::vector<JointSet> joints;
     std::vector<WeightSet> weights;
+    std::vector<uint32_t> sourcePointIndices;
     std::vector<uint32_t> indices;
     std::vector<SubmeshData> submeshes;
+    std::vector<MorphTargetData> morphTargets;
     std::vector<uint32_t> nodeIds;
 };
 
@@ -957,6 +988,9 @@ hashVertex(const MeshData& mesh, size_t index)
     if (mesh.weights.size() == mesh.positions.size()) {
         hashValue(hash, mesh.weights[index]);
     }
+    if (mesh.sourcePointIndices.size() == mesh.positions.size()) {
+        hashValue(hash, mesh.sourcePointIndices[index]);
+    }
     return hash;
 }
 
@@ -974,12 +1008,16 @@ bool
 verticesEqual(const MeshData& mesh, size_t left, size_t right)
 {
     const size_t count = mesh.positions.size();
-    return mesh.positions[left] == mesh.positions[right] &&
-           vertexValueEqual(mesh.normals, count, left, right) &&
-           vertexValueEqual(mesh.uvs, count, left, right) &&
-           vertexValueEqual(mesh.colors, count, left, right) &&
-           vertexValueEqual(mesh.joints, count, left, right) &&
-           vertexValueEqual(mesh.weights, count, left, right);
+    if (mesh.positions[left] != mesh.positions[right] ||
+        !vertexValueEqual(mesh.normals, count, left, right) ||
+        !vertexValueEqual(mesh.uvs, count, left, right) ||
+        !vertexValueEqual(mesh.colors, count, left, right) ||
+        !vertexValueEqual(mesh.joints, count, left, right) ||
+        !vertexValueEqual(mesh.weights, count, left, right) ||
+        !vertexValueEqual(mesh.sourcePointIndices, count, left, right)) {
+        return false;
+    }
+    return true;
 }
 
 template<typename T>
@@ -1016,7 +1054,18 @@ optimizeMesh(MeshData& mesh)
     welded.colors.reserve(mesh.colors.size());
     welded.joints.reserve(mesh.joints.size());
     welded.weights.reserve(mesh.weights.size());
+    welded.sourcePointIndices.reserve(mesh.sourcePointIndices.size());
     welded.indices.reserve(mesh.indices.size());
+    welded.morphTargets.reserve(mesh.morphTargets.size());
+    for (MorphTargetData& source : mesh.morphTargets) {
+        MorphTargetData target;
+        target.name = source.name;
+        target.influence = source.influence;
+        target.animation = source.animation;
+        target.pointOffsets = std::move(source.pointOffsets);
+        target.normalOffsets = std::move(source.normalOffsets);
+        welded.morphTargets.push_back(std::move(target));
+    }
 
     struct Candidate
     {
@@ -1070,9 +1119,39 @@ optimizeMesh(MeshData& mesh)
           welded.joints, mesh.joints, sourceVertexCount, sourceIndex);
         appendVertexValue(
           welded.weights, mesh.weights, sourceVertexCount, sourceIndex);
+        appendVertexValue(welded.sourcePointIndices,
+                          mesh.sourcePointIndices,
+                          sourceVertexCount,
+                          sourceIndex);
         welded.indices.push_back(weldedIndex);
     }
 
+    for (MorphTargetData& target : welded.morphTargets) {
+        target.positions.reserve(welded.positions.size());
+        if (!target.normalOffsets.empty()) {
+            target.normals.reserve(welded.normals.size());
+        }
+        for (size_t vertexIndex = 0;
+             vertexIndex < welded.positions.size();
+             ++vertexIndex) {
+            const uint32_t pointIndex =
+              welded.sourcePointIndices[vertexIndex];
+            target.positions.push_back(
+              welded.positions[vertexIndex] + target.pointOffsets[pointIndex]);
+            if (!target.normalOffsets.empty()) {
+                GfVec3f normal =
+                  welded.normals[vertexIndex] + target.normalOffsets[pointIndex];
+                normal.Normalize();
+                target.normals.push_back(normal);
+            }
+        }
+        target.pointOffsets.clear();
+        target.pointOffsets.shrink_to_fit();
+        target.normalOffsets.clear();
+        target.normalOffsets.shrink_to_fit();
+    }
+    welded.sourcePointIndices.clear();
+    welded.sourcePointIndices.shrink_to_fit();
     mesh = std::move(welded);
     return true;
 }
@@ -1336,6 +1415,203 @@ readSkinning(const SkinBinding* skin,
     return true;
 }
 
+bool
+computeMorphWeights(const UsdSkelAnimQuery& animation,
+                    const UsdSkelAnimMapper& mapper,
+                    const UsdSkelBlendShapeQuery& blendShapes,
+                    const UsdTimeCode time,
+                    VtFloatArray& flattened)
+{
+    VtFloatArray animationWeights;
+    if (!animation.ComputeBlendShapeWeights(&animationWeights, time)) {
+        return false;
+    }
+    VtFloatArray localWeights;
+    const float zero = 0.0f;
+    if (!mapper.Remap(animationWeights, &localWeights, 1, &zero)) {
+        return false;
+    }
+    return blendShapes.ComputeFlattenedSubShapeWeights(localWeights, &flattened);
+}
+
+bool
+expandMorphOffsets(const VtVec3fArray& authored,
+                   const VtIntArray& pointIndices,
+                   size_t pointCount,
+                   const UsdPrim& blendShape,
+                   const char* label,
+                   std::vector<GfVec3f>& expanded)
+{
+    expanded.assign(pointCount, GfVec3f(0.0f));
+    if (authored.empty()) {
+        return true;
+    }
+    if (pointIndices.empty()) {
+        if (authored.size() != pointCount) {
+            TF_WARN("Blend shape <%s> has %zu %s offsets for %zu mesh points.",
+                    blendShape.GetPath().GetText(),
+                    authored.size(),
+                    label,
+                    pointCount);
+            return false;
+        }
+        std::copy(authored.begin(), authored.end(), expanded.begin());
+        return true;
+    }
+    if (authored.size() != pointIndices.size()) {
+        TF_WARN("Blend shape <%s> has mismatched %s offsets and point indices.",
+                blendShape.GetPath().GetText(),
+                label);
+        return false;
+    }
+    for (size_t index = 0; index < pointIndices.size(); ++index) {
+        const int pointIndex = pointIndices[index];
+        if (pointIndex < 0 || static_cast<size_t>(pointIndex) >= pointCount) {
+            TF_WARN("Blend shape <%s> has an invalid point index %d.",
+                    blendShape.GetPath().GetText(),
+                    pointIndex);
+            return false;
+        }
+        expanded[pointIndex] = authored[index];
+    }
+    return true;
+}
+
+std::vector<SourceMorphTarget>
+readMorphTargets(SceneData& scene,
+                 const UsdGeomMesh& mesh,
+                 size_t pointCount)
+{
+    const UsdSkelBindingAPI binding(mesh.GetPrim());
+    const UsdSkelBlendShapeQuery query(binding);
+    if (!query || query.GetNumSubShapes() == 0) {
+        return {};
+    }
+
+    const std::vector<VtIntArray> pointIndices =
+      query.ComputeBlendShapePointIndices();
+    const std::vector<VtVec3fArray> pointOffsets =
+      query.ComputeSubShapePointOffsets();
+    const std::vector<VtVec3fArray> normalOffsets =
+      query.ComputeSubShapeNormalOffsets();
+    if (pointOffsets.size() != query.GetNumSubShapes() ||
+        normalOffsets.size() != query.GetNumSubShapes() ||
+        pointIndices.size() != query.GetNumBlendShapes()) {
+        TF_WARN("Could not resolve blend shapes for mesh <%s>.",
+                mesh.GetPath().GetText());
+        return {};
+    }
+
+    VtFloatArray initialWeights(query.GetNumSubShapes(), 0.0f);
+    std::vector<float> animationTimes;
+    std::vector<VtFloatArray> animationWeights;
+    VtTokenArray localOrder;
+    const UsdPrim animationPrim = binding.GetInheritedAnimationSource();
+    const UsdSkelAnimation animationSchema(animationPrim);
+    const UsdSkelAnimQuery animation =
+      animationSchema ? scene.skelCache.GetAnimQuery(animationSchema)
+                      : UsdSkelAnimQuery();
+    if (animation &&
+        binding.GetBlendShapesAttr().Get(&localOrder) &&
+        localOrder.size() == query.GetNumBlendShapes()) {
+        const UsdSkelAnimMapper mapper(
+          animation.GetBlendShapeOrder(), localOrder);
+        VtFloatArray resolvedInitial;
+        if (computeMorphWeights(animation,
+                                mapper,
+                                query,
+                                UsdTimeCode::Default(),
+                                resolvedInitial) &&
+            resolvedInitial.size() == query.GetNumSubShapes()) {
+            initialWeights = std::move(resolvedInitial);
+        }
+
+        std::vector<double> times;
+        animation.GetBlendShapeWeightTimeSamples(&times);
+        addFrameIntervalSamples(times);
+        for (const double sampleTime : times) {
+            VtFloatArray resolved;
+            if (computeMorphWeights(animation,
+                                    mapper,
+                                    query,
+                                    UsdTimeCode(sampleTime),
+                                    resolved) &&
+                resolved.size() == query.GetNumSubShapes()) {
+                animationTimes.push_back(static_cast<float>(sampleTime));
+                animationWeights.push_back(std::move(resolved));
+            }
+        }
+    }
+
+    std::vector<SourceMorphTarget> result;
+    result.reserve(query.GetNumSubShapes());
+    for (size_t subShapeIndex = 0;
+         subShapeIndex < query.GetNumSubShapes();
+         ++subShapeIndex) {
+        if (pointOffsets[subShapeIndex].empty()) {
+            continue;
+        }
+        const size_t blendShapeIndex =
+          query.GetBlendShapeIndex(subShapeIndex);
+        if (blendShapeIndex >= pointIndices.size()) {
+            continue;
+        }
+        const UsdSkelBlendShape blendShape =
+          query.GetBlendShape(blendShapeIndex);
+        if (!blendShape) {
+            continue;
+        }
+
+        SourceMorphTarget target;
+        target.subShapeIndex = subShapeIndex;
+        target.target.name = displayName(blendShape.GetPrim(), "Blend shape");
+        const UsdSkelInbetweenShape inbetween =
+          query.GetInbetween(subShapeIndex);
+        if (inbetween) {
+            target.target.name += " " + inbetween.GetAttr().GetName().GetString();
+        }
+        target.target.influence = initialWeights[subShapeIndex];
+        if (!expandMorphOffsets(pointOffsets[subShapeIndex],
+                                pointIndices[blendShapeIndex],
+                                pointCount,
+                                blendShape.GetPrim(),
+                                "position",
+                                target.pointOffsets)) {
+            continue;
+        }
+        if (!normalOffsets[subShapeIndex].empty() &&
+            !expandMorphOffsets(normalOffsets[subShapeIndex],
+                                pointIndices[blendShapeIndex],
+                                pointCount,
+                                blendShape.GetPrim(),
+                                "normal",
+                                target.normalOffsets)) {
+            continue;
+        }
+        target.target.animation.times = animationTimes;
+        target.target.animation.influences.reserve(animationWeights.size());
+        for (const VtFloatArray& weights : animationWeights) {
+            target.target.animation.influences.push_back(
+              weights[subShapeIndex]);
+        }
+        result.push_back(std::move(target));
+    }
+    const bool hasNormalOffsets =
+      std::any_of(result.begin(),
+                  result.end(),
+                  [](const SourceMorphTarget& target) {
+                      return !target.normalOffsets.empty();
+                  });
+    if (hasNormalOffsets) {
+        for (SourceMorphTarget& target : result) {
+            if (target.normalOffsets.empty()) {
+                target.normalOffsets.assign(pointCount, GfVec3f(0.0f));
+            }
+        }
+    }
+    return result;
+}
+
 std::string
 meshCacheKey(const UsdPrim& prim,
              const std::vector<uint32_t>& faceMaterials,
@@ -1468,13 +1744,22 @@ extractMesh(const UsdGeomMesh& usdMesh,
     const bool outputLeftHanded = sourceLeftHanded != bakedReflection;
     const uint32_t skeletonId =
       skinningValid ? skin->skeletonId : kMissingOffset;
-    const std::string key =
+    std::string key =
       meshCacheKey(usdMesh.GetPrim(),
                    faceMaterials,
                    skeletonId,
                    doubleSided,
                    outputLeftHanded) +
       cacheSuffix;
+    const UsdSkelBindingAPI blendShapeBinding(usdMesh.GetPrim());
+    if (blendShapeBinding.GetBlendShapesAttr().HasAuthoredValue()) {
+        const UsdPrim animationSource =
+          blendShapeBinding.GetInheritedAnimationSource();
+        key += "|morphAnimation:";
+        key += animationSource
+                 ? animationSource.GetPath().GetString()
+                 : std::string("none");
+    }
     const auto cached = scene.meshIds.find(key);
     if (cached != scene.meshIds.end()) {
         scene.meshes[cached->second].nodeIds.push_back(nodeId);
@@ -1501,6 +1786,19 @@ extractMesh(const UsdGeomMesh& usdMesh,
         normalData.values.assign(generatedNormals.begin(), generatedNormals.end());
         normalData.interpolation = UsdGeomTokens->vertex;
     }
+    const GfMatrix4d normalTransform = geomBind.GetInverse().GetTranspose();
+    std::vector<SourceMorphTarget> morphTargets =
+      readMorphTargets(scene, usdMesh, points.size());
+    for (SourceMorphTarget& target : morphTargets) {
+        for (GfVec3f& offset : target.pointOffsets) {
+            offset = GfVec3f(
+              geomBind.TransformDir(GfVec3d(offset)));
+        }
+        for (GfVec3f& offset : target.normalOffsets) {
+            offset = GfVec3f(
+              normalTransform.TransformDir(GfVec3d(offset)));
+        }
+    }
     TfToken uvName;
     if (!materialUvName(scene, faceMaterials, uvName)) {
         return false;
@@ -1517,8 +1815,6 @@ extractMesh(const UsdGeomMesh& usdMesh,
       readAuthoredPrimvar<GfVec3f>(gprim.GetDisplayColorPrimvar(), time);
     const PrimvarData<float> opacityData =
       readAuthoredPrimvar<float>(gprim.GetDisplayOpacityPrimvar(), time);
-
-    const GfMatrix4d normalTransform = geomBind.GetInverse().GetTranspose();
 
     std::map<uint32_t, std::vector<uint32_t>> materialIndices;
     auto appendVertex = [&](size_t faceIndex, size_t cornerIndex, int pointIndex) {
@@ -1548,6 +1844,10 @@ extractMesh(const UsdGeomMesh& usdMesh,
         if (!pointJoints.empty()) {
             mesh.joints.push_back(pointJoints[point]);
             mesh.weights.push_back(pointWeights[point]);
+        }
+        if (!morphTargets.empty()) {
+            mesh.sourcePointIndices.push_back(
+              static_cast<uint32_t>(point));
         }
         return static_cast<uint32_t>(mesh.positions.size() - 1);
     };
@@ -1582,6 +1882,12 @@ extractMesh(const UsdGeomMesh& usdMesh,
         submesh.indexCount = static_cast<uint32_t>(indices.size());
         mesh.indices.insert(mesh.indices.end(), indices.begin(), indices.end());
         mesh.submeshes.push_back(submesh);
+    }
+    mesh.morphTargets.reserve(morphTargets.size());
+    for (SourceMorphTarget& target : morphTargets) {
+        target.target.pointOffsets = std::move(target.pointOffsets);
+        target.target.normalOffsets = std::move(target.normalOffsets);
+        mesh.morphTargets.push_back(std::move(target.target));
     }
     mesh.nodeIds.push_back(nodeId);
     const size_t meshIndex = scene.meshes.size();
@@ -2407,6 +2713,8 @@ packScene(const SceneData& scene, SceneBuffers& result)
         commands.end(record);
     }
 
+    std::vector<std::vector<uint32_t>> morphTargetIds(scene.meshes.size());
+    uint32_t nextMorphTargetId = 1;
     for (size_t meshIndex = 0; meshIndex < scene.meshes.size(); ++meshIndex) {
         const MeshData& mesh = scene.meshes[meshIndex];
         const uint32_t positionsOffset = appendArray(data, mesh.positions);
@@ -2505,6 +2813,31 @@ packScene(const SceneData& scene, SceneBuffers& result)
         commands.buffer.u32(static_cast<uint32_t>(mesh.submeshes.size()));
         commands.end(meshRecord);
         ++result.meshCount;
+
+        morphTargetIds[meshIndex].reserve(mesh.morphTargets.size());
+        for (const MorphTargetData& target : mesh.morphTargets) {
+            const uint32_t targetId = nextMorphTargetId++;
+            morphTargetIds[meshIndex].push_back(targetId);
+            const uint32_t positionsOffset =
+              appendArray(data, target.positions);
+            const uint32_t normalsOffset =
+              appendArray(data, target.normals);
+            uint32_t targetNameLength = 0;
+            const uint32_t targetNameOffset =
+              appendString(data, target.name, targetNameLength);
+            const uint32_t targetRecord =
+              commands.begin(Command::MorphTarget);
+            commands.buffer.u32(targetId);
+            commands.buffer.u32(static_cast<uint32_t>(meshIndex + 1));
+            commands.buffer.u32(targetNameOffset);
+            commands.buffer.u32(targetNameLength);
+            commands.buffer.u32(
+              static_cast<uint32_t>(target.positions.size()));
+            commands.buffer.u32(positionsOffset);
+            commands.buffer.u32(normalsOffset);
+            commands.buffer.f32(target.influence);
+            commands.end(targetRecord);
+        }
 
         for (size_t placement = 1; placement < mesh.nodeIds.size(); ++placement) {
             const std::string name = mesh.name + " instance";
@@ -2616,6 +2949,25 @@ packScene(const SceneData& scene, SceneBuffers& result)
                           matrices.data(),
                           matrices.size() * sizeof(GfMatrix4f),
                           16);
+        }
+    }
+
+    for (size_t meshIndex = 0; meshIndex < scene.meshes.size(); ++meshIndex) {
+        const MeshData& mesh = scene.meshes[meshIndex];
+        for (size_t targetIndex = 0;
+             targetIndex < mesh.morphTargets.size();
+             ++targetIndex) {
+            const MorphTargetAnimation& animation =
+              mesh.morphTargets[targetIndex].animation;
+            emitAnimation(commands,
+                          data,
+                          AnimationTarget::MorphTarget,
+                          morphTargetIds[meshIndex][targetIndex],
+                          AnimationProperty::Influence,
+                          animation.times,
+                          animation.influences.data(),
+                          animation.influences.size() * sizeof(float),
+                          1);
         }
     }
 

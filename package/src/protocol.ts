@@ -14,6 +14,7 @@ export const enum Command {
     Animation = 9,
     AnalyticPrimitive = 10,
     ThinInstances = 11,
+    MorphTarget = 12,
 }
 
 export const enum AnalyticPrimitiveType {
@@ -32,6 +33,7 @@ export const enum PrimitiveAxis {
 export const enum AnimationTarget {
     Node = 0,
     Bone = 1,
+    MorphTarget = 2,
 }
 
 export const enum AnimationProperty {
@@ -39,6 +41,7 @@ export const enum AnimationProperty {
     RotationQuaternion = 1,
     Scaling = 2,
     Matrix = 3,
+    Influence = 4,
 }
 
 export const enum MaterialFlags {
@@ -105,6 +108,8 @@ function expectedPayloadLength(opcode: Command): number {
             return 44;
         case Command.ThinInstances:
             return 12;
+        case Command.MorphTarget:
+            return 32;
         default:
             throw new Error(
                 `Unknown OpenUSD Babylon command opcode ${opcode}.`,

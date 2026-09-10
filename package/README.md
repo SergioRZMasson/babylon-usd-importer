@@ -77,7 +77,9 @@ instances, static `UsdGeomPointInstancer` batches backed by one thin-instance ma
 per prototype mesh, skeletons, skinning, animation, and native
 cube/sphere/cylinder/cone commands backed by Babylon procedural mesh builders. Skeleton
 joint records preserve separate local rest and bind matrices so animated joints retain
-their authored pivots.
+their authored pivots. Sparse USD blend shapes and in-betweens are expanded after vertex
+welding into data-buffer views owned by Babylon `MorphTargetManager` instances, and
+blend-shape weight animation is emitted as scalar influence tracks.
 
 The package has a Babylon.js peer dependency and contains the generated OpenUSD Wasm module
 under `dist/wasm`.
