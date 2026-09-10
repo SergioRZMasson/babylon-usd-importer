@@ -23,11 +23,13 @@
 #include <pxr/usd/usdGeom/cylinder.h>
 #include <pxr/usd/usdGeom/mesh.h>
 #include <pxr/usd/usdGeom/metrics.h>
+#include <pxr/usd/usdGeom/pointInstancer.h>
 #include <pxr/usd/usdGeom/primvar.h>
 #include <pxr/usd/usdGeom/primvarsAPI.h>
 #include <pxr/usd/usdGeom/subset.h>
 #include <pxr/usd/usdGeom/sphere.h>
 #include <pxr/usd/usdGeom/tokens.h>
+#include <pxr/usd/usdGeom/xformCache.h>
 #include <pxr/usd/usdGeom/xformable.h>
 #include <pxr/usd/usdShade/connectableAPI.h>
 #include <pxr/usd/usdShade/input.h>
@@ -286,6 +288,13 @@ struct SkeletonData
     SkeletonAnimation animation;
 };
 
+struct ThinInstanceData
+{
+    size_t sourceIndex = 0;
+    bool analyticSource = false;
+    std::vector<GfMatrix4d> transforms;
+};
+
 struct SkinBinding
 {
     uint32_t skeletonId = kMissingOffset;
@@ -305,6 +314,7 @@ struct SceneData
     std::vector<MeshData> meshes;
     std::unordered_map<std::string, size_t> meshIds;
     std::unordered_map<std::string, bool> meshWinding;
+    std::vector<ThinInstanceData> thinInstances;
     std::vector<AnalyticPrimitiveData> analyticPrimitives;
     std::unordered_map<std::string, size_t> analyticPrimitiveIds;
     std::unordered_map<std::string, uint32_t> analyticMaterialIds;
@@ -690,10 +700,11 @@ boundMaterialId(SceneData& scene, const UsdPrim& prim)
 
 template<typename T>
 PrimvarData<T>
-readPrimvar(const UsdGeomPrimvar& primvar)
+readPrimvar(const UsdGeomPrimvar& primvar,
+            const UsdTimeCode time = UsdTimeCode::Default())
 {
     PrimvarData<T> result;
-    if (!primvar || !primvar.ComputeFlattened(&result.values, UsdTimeCode::Default())) {
+    if (!primvar || !primvar.ComputeFlattened(&result.values, time)) {
         return {};
     }
     result.interpolation = primvar.GetInterpolation();
@@ -705,33 +716,38 @@ readPrimvar(const UsdGeomPrimvar& primvar)
 
 template<typename T>
 PrimvarData<T>
-readAuthoredPrimvar(const UsdGeomPrimvar& primvar)
+readAuthoredPrimvar(const UsdGeomPrimvar& primvar,
+                    const UsdTimeCode time = UsdTimeCode::Default())
 {
-    return primvar && primvar.HasAuthoredValue() ? readPrimvar<T>(primvar)
+    return primvar && primvar.HasAuthoredValue() ? readPrimvar<T>(primvar, time)
                                                  : PrimvarData<T>{};
 }
 
 PrimvarData<GfVec3f>
-readNormals(const UsdGeomMesh& mesh)
+readNormals(const UsdGeomMesh& mesh,
+            const UsdTimeCode time = UsdTimeCode::Default())
 {
     const UsdGeomPrimvar authored =
       UsdGeomPrimvarsAPI(mesh.GetPrim()).GetPrimvar(TfToken("normals"));
-    PrimvarData<GfVec3f> result = readPrimvar<GfVec3f>(authored);
+    PrimvarData<GfVec3f> result = readPrimvar<GfVec3f>(authored, time);
     if (result) {
         return result;
     }
-    mesh.GetNormalsAttr().Get(&result.values, UsdTimeCode::Default());
+    mesh.GetNormalsAttr().Get(&result.values, time);
     result.interpolation = mesh.GetNormalsInterpolation();
     return result;
 }
 
 PrimvarData<GfVec2f>
-readUvs(const UsdGeomMesh& mesh, const TfToken& requestedName)
+readUvs(const UsdGeomMesh& mesh,
+        const TfToken& requestedName,
+        const UsdTimeCode time = UsdTimeCode::Default())
 {
     const UsdGeomPrimvarsAPI primvars(mesh.GetPrim());
     if (!requestedName.IsEmpty()) {
         PrimvarData<GfVec2f> requested =
-          readPrimvar<GfVec2f>(primvars.FindPrimvarWithInheritance(requestedName));
+          readPrimvar<GfVec2f>(
+            primvars.FindPrimvarWithInheritance(requestedName), time);
         if (requested) {
             return requested;
         }
@@ -744,13 +760,14 @@ readUvs(const UsdGeomMesh& mesh, const TfToken& requestedName)
         TfToken("st"), TfToken("uv"), TfToken("UVMap")
     };
     for (const TfToken& name : preferred) {
-        PrimvarData<GfVec2f> result = readPrimvar<GfVec2f>(primvars.GetPrimvar(name));
+        PrimvarData<GfVec2f> result =
+          readPrimvar<GfVec2f>(primvars.GetPrimvar(name), time);
         if (result) {
             return result;
         }
     }
     for (const UsdGeomPrimvar& primvar : primvars.GetPrimvarsWithValues()) {
-        PrimvarData<GfVec2f> result = readPrimvar<GfVec2f>(primvar);
+        PrimvarData<GfVec2f> result = readPrimvar<GfVec2f>(primvar, time);
         if (result) {
             return result;
         }
@@ -1260,7 +1277,8 @@ readSkinning(const SkinBinding* skin,
              GfMatrix4d& geomBind,
              uint32_t& influenceCount,
              std::vector<JointSet>& joints,
-             std::vector<WeightSet>& weights)
+             std::vector<WeightSet>& weights,
+             const UsdTimeCode time = UsdTimeCode::Default())
 {
     if (!skin) {
         return false;
@@ -1268,7 +1286,7 @@ readSkinning(const SkinBinding* skin,
     VtIntArray sourceJoints;
     VtFloatArray sourceWeights;
     if (!skin->query.ComputeVaryingJointInfluences(
-          pointCount, &sourceJoints, &sourceWeights, UsdTimeCode::Default())) {
+          pointCount, &sourceJoints, &sourceWeights, time)) {
         return false;
     }
     const int sourceInfluences = skin->query.GetNumInfluencesPerComponent();
@@ -1314,7 +1332,7 @@ readSkinning(const SkinBinding* skin,
             weights[point][0] = 1.0f;
         }
     }
-    geomBind = skin->query.GetGeomBindTransform(UsdTimeCode::Default());
+    geomBind = skin->query.GetGeomBindTransform(time);
     return true;
 }
 
@@ -1343,14 +1361,17 @@ bool
 extractMesh(const UsdGeomMesh& usdMesh,
             uint32_t nodeId,
             SceneData& scene,
-            const SkinBinding* skin)
+            const SkinBinding* skin,
+            size_t* meshIndexOut = nullptr,
+            const std::string& cacheSuffix = {},
+            const UsdTimeCode time = UsdTimeCode::Default())
 {
     VtVec3fArray points;
     VtIntArray faceCounts;
     VtIntArray faceIndices;
-    if (!usdMesh.GetPointsAttr().Get(&points, UsdTimeCode::Default()) ||
-        !usdMesh.GetFaceVertexCountsAttr().Get(&faceCounts, UsdTimeCode::Default()) ||
-        !usdMesh.GetFaceVertexIndicesAttr().Get(&faceIndices, UsdTimeCode::Default()) ||
+    if (!usdMesh.GetPointsAttr().Get(&points, time) ||
+        !usdMesh.GetFaceVertexCountsAttr().Get(&faceCounts, time) ||
+        !usdMesh.GetFaceVertexIndicesAttr().Get(&faceIndices, time) ||
         points.empty() || faceCounts.empty()) {
         return false;
     }
@@ -1374,7 +1395,7 @@ extractMesh(const UsdGeomMesh& usdMesh,
     for (const UsdGeomSubset& subset :
          UsdShadeMaterialBindingAPI(usdMesh.GetPrim()).GetMaterialBindSubsets()) {
         VtIntArray subsetFaces;
-        if (!subset.GetIndicesAttr().Get(&subsetFaces, UsdTimeCode::Default())) {
+        if (!subset.GetIndicesAttr().Get(&subsetFaces, time)) {
             continue;
         }
         const uint32_t subsetMaterial = boundMaterialId(scene, subset.GetPrim());
@@ -1386,11 +1407,11 @@ extractMesh(const UsdGeomMesh& usdMesh,
     }
 
     bool doubleSided = false;
-    usdMesh.GetDoubleSidedAttr().Get(&doubleSided, UsdTimeCode::Default());
+    usdMesh.GetDoubleSidedAttr().Get(&doubleSided, time);
     TfToken orientation = UsdGeomTokens->rightHanded;
     UsdGeomGprim(usdMesh.GetPrim())
       .GetOrientationAttr()
-      .Get(&orientation, UsdTimeCode::Default());
+      .Get(&orientation, time);
     const bool declaredLeftHanded = orientation == UsdGeomTokens->leftHanded;
     const UsdPrim sourcePrim =
       usdMesh.GetPrim().IsInstanceProxy() ? usdMesh.GetPrim().GetPrimInPrototype()
@@ -1405,7 +1426,7 @@ extractMesh(const UsdGeomMesh& usdMesh,
     if (cachedWinding != scene.meshWinding.end()) {
         sourceLeftHanded = cachedWinding->second;
     } else {
-        normalData = readNormals(usdMesh);
+        normalData = readNormals(usdMesh, time);
         normalsRead = true;
         if (const std::optional<bool> inferred =
               inferLeftHandedWinding(points, faceCounts, faceIndices, normalData)) {
@@ -1426,7 +1447,13 @@ extractMesh(const UsdGeomMesh& usdMesh,
     bool skinningValid = false;
     if (skin) {
         skinningValid = readSkinning(
-          skin, points.size(), geomBind, influenceCount, pointJoints, pointWeights);
+          skin,
+          points.size(),
+          geomBind,
+          influenceCount,
+          pointJoints,
+          pointWeights,
+          time);
         if (!skinningValid) {
             TF_WARN(
               "Could not read skinning influences for mesh <%s>; emitting it as a static mesh.",
@@ -1441,14 +1468,19 @@ extractMesh(const UsdGeomMesh& usdMesh,
     const bool outputLeftHanded = sourceLeftHanded != bakedReflection;
     const uint32_t skeletonId =
       skinningValid ? skin->skeletonId : kMissingOffset;
-    const std::string key = meshCacheKey(usdMesh.GetPrim(),
-                                         faceMaterials,
-                                         skeletonId,
-                                         doubleSided,
-                                         outputLeftHanded);
+    const std::string key =
+      meshCacheKey(usdMesh.GetPrim(),
+                   faceMaterials,
+                   skeletonId,
+                   doubleSided,
+                   outputLeftHanded) +
+      cacheSuffix;
     const auto cached = scene.meshIds.find(key);
     if (cached != scene.meshIds.end()) {
         scene.meshes[cached->second].nodeIds.push_back(nodeId);
+        if (meshIndexOut) {
+            *meshIndexOut = cached->second;
+        }
         return true;
     }
 
@@ -1460,7 +1492,7 @@ extractMesh(const UsdGeomMesh& usdMesh,
     mesh.influenceCount = influenceCount;
 
     if (!normalsRead) {
-        normalData = readNormals(usdMesh);
+        normalData = readNormals(usdMesh, time);
     }
     std::vector<GfVec3f> generatedNormals;
     if (!normalData) {
@@ -1473,7 +1505,7 @@ extractMesh(const UsdGeomMesh& usdMesh,
     if (!materialUvName(scene, faceMaterials, uvName)) {
         return false;
     }
-    const PrimvarData<GfVec2f> uvData = readUvs(usdMesh, uvName);
+    const PrimvarData<GfVec2f> uvData = readUvs(usdMesh, uvName, time);
     if (!uvName.IsEmpty() && !uvData) {
         TF_WARN("Cannot emit mesh <%s>: its material textures require UV primvar '%s'.",
                 usdMesh.GetPath().GetText(),
@@ -1482,9 +1514,9 @@ extractMesh(const UsdGeomMesh& usdMesh,
     }
     const UsdGeomGprim gprim(usdMesh.GetPrim());
     const PrimvarData<GfVec3f> colorData =
-      readAuthoredPrimvar<GfVec3f>(gprim.GetDisplayColorPrimvar());
+      readAuthoredPrimvar<GfVec3f>(gprim.GetDisplayColorPrimvar(), time);
     const PrimvarData<float> opacityData =
-      readAuthoredPrimvar<float>(gprim.GetDisplayOpacityPrimvar());
+      readAuthoredPrimvar<float>(gprim.GetDisplayOpacityPrimvar(), time);
 
     const GfMatrix4d normalTransform = geomBind.GetInverse().GetTranspose();
 
@@ -1555,15 +1587,248 @@ extractMesh(const UsdGeomMesh& usdMesh,
     const size_t meshIndex = scene.meshes.size();
     scene.meshIds.emplace(key, meshIndex);
     scene.meshes.push_back(std::move(mesh));
+    if (meshIndexOut) {
+        *meshIndexOut = meshIndex;
+    }
     return true;
 }
 
 bool
-isVisible(const UsdPrim& prim)
+isVisible(const UsdPrim& prim,
+          const UsdTimeCode time = UsdTimeCode::Default())
 {
     const UsdGeomImageable imageable(prim);
     return !imageable ||
-           imageable.ComputeVisibility(UsdTimeCode::Default()) != UsdGeomTokens->invisible;
+           imageable.ComputeVisibility(time) != UsdGeomTokens->invisible;
+}
+
+bool
+extractAnalyticPrimitive(const UsdPrim& prim,
+                         uint32_t nodeId,
+                         SceneData& scene,
+                         size_t* primitiveIndexOut,
+                         const std::string& cacheSuffix,
+                         UsdTimeCode time);
+
+bool
+extractPointInstancer(const UsdGeomPointInstancer& instancer,
+                      uint32_t nodeId,
+                      SceneData& scene)
+{
+    SdfPathVector prototypePaths;
+    if (!instancer.GetPrototypesRel().GetForwardedTargets(&prototypePaths) ||
+        prototypePaths.empty()) {
+        TF_WARN("Skipping point instancer <%s> without prototypes.",
+                instancer.GetPath().GetText());
+        return true;
+    }
+
+    std::vector<double> instanceTimes;
+    const std::array<UsdAttribute, 11> instanceAttributes = {
+        instancer.GetProtoIndicesAttr(),
+        instancer.GetPositionsAttr(),
+        instancer.GetOrientationsAttr(),
+        instancer.GetOrientationsfAttr(),
+        instancer.GetScalesAttr(),
+        instancer.GetVelocitiesAttr(),
+        instancer.GetAccelerationsAttr(),
+        instancer.GetAngularVelocitiesAttr(),
+        instancer.GetIdsAttr(),
+        instancer.GetInvisibleIdsAttr(),
+        instancer.GetVisibilityAttr(),
+    };
+    for (const UsdAttribute& attribute : instanceAttributes) {
+        std::vector<double> attributeTimes;
+        attribute.GetTimeSamples(&attributeTimes);
+        instanceTimes.insert(
+          instanceTimes.end(), attributeTimes.begin(), attributeTimes.end());
+    }
+    for (const SdfPath& prototypePath : prototypePaths) {
+        const UsdPrim prototype =
+          instancer.GetPrim().GetStage()->GetPrimAtPath(prototypePath);
+        for (const UsdPrim& prim :
+             UsdPrimRange(prototype, UsdTraverseInstanceProxies())) {
+            for (const UsdAttribute& attribute : prim.GetAttributes()) {
+                std::vector<double> attributeTimes;
+                attribute.GetTimeSamples(&attributeTimes);
+                instanceTimes.insert(instanceTimes.end(),
+                                     attributeTimes.begin(),
+                                     attributeTimes.end());
+            }
+        }
+    }
+    std::sort(instanceTimes.begin(), instanceTimes.end());
+    instanceTimes.erase(std::unique(instanceTimes.begin(), instanceTimes.end()),
+                        instanceTimes.end());
+    const bool unsupportedAnimation = instanceTimes.size() > 1;
+    std::vector<double> instancerTransformTimes;
+    UsdGeomXformable(instancer).GetTimeSamples(&instancerTransformTimes);
+    instanceTimes.insert(instanceTimes.end(),
+                         instancerTransformTimes.begin(),
+                         instancerTransformTimes.end());
+    std::sort(instanceTimes.begin(), instanceTimes.end());
+    instanceTimes.erase(std::unique(instanceTimes.begin(), instanceTimes.end()),
+                        instanceTimes.end());
+    const UsdTimeCode time =
+      instanceTimes.empty()
+        ? UsdTimeCode::Default()
+        : UsdTimeCode(instanceTimes.front());
+    if (unsupportedAnimation) {
+        TF_WARN("Point instancer <%s> has animated instance or prototype data; "
+                "importing its first frame as static thin instances.",
+                instancer.GetPath().GetText());
+    }
+    if (!isVisible(instancer.GetPrim(), time)) {
+        return true;
+    }
+    if (!time.IsDefault()) {
+        NodeData& instancerNode = scene.nodes[nodeId - 1];
+        bool resetsXformStack = false;
+        UsdGeomXformable(instancer).GetLocalTransformation(
+          &instancerNode.localTransform, &resetsXformStack, time);
+        if (resetsXformStack) {
+            instancerNode.parentId = kMissingOffset;
+        }
+    }
+
+    VtIntArray prototypeIndices;
+    if (!instancer.GetProtoIndicesAttr().Get(&prototypeIndices, time)) {
+        TF_WARN("Skipping point instancer <%s> without prototype indices.",
+                instancer.GetPath().GetText());
+        return true;
+    }
+
+    UsdGeomXformCache xformCache(time);
+    VtMatrix4dArray instanceTransforms;
+    if (!instancer.ComputeInstanceTransformsAtTime(
+          &instanceTransforms,
+          time,
+          time,
+          UsdGeomPointInstancer::IncludeProtoXform,
+          UsdGeomPointInstancer::IgnoreMask) ||
+        instanceTransforms.size() != prototypeIndices.size()) {
+        TF_WARN("Could not compute transforms for point instancer <%s>.",
+                instancer.GetPath().GetText());
+        return false;
+    }
+
+    const std::vector<bool> mask = instancer.ComputeMaskAtTime(time);
+    if (!mask.empty() && mask.size() != prototypeIndices.size()) {
+        TF_WARN("Point instancer <%s> produced an invalid visibility mask.",
+                instancer.GetPath().GetText());
+        return false;
+    }
+
+    std::vector<std::vector<size_t>> instancesByPrototype(prototypePaths.size());
+    for (size_t instanceIndex = 0; instanceIndex < prototypeIndices.size();
+         ++instanceIndex) {
+        const int prototypeIndex = prototypeIndices[instanceIndex];
+        if (prototypeIndex < 0 ||
+            static_cast<size_t>(prototypeIndex) >= prototypePaths.size()) {
+            TF_WARN("Point instancer <%s> references invalid prototype index %d.",
+                    instancer.GetPath().GetText(),
+                    prototypeIndex);
+            return false;
+        }
+        if (mask.empty() || mask[instanceIndex]) {
+            instancesByPrototype[prototypeIndex].push_back(instanceIndex);
+        }
+    }
+    const UsdStagePtr stage = instancer.GetPrim().GetStage();
+    for (size_t prototypeIndex = 0; prototypeIndex < prototypePaths.size();
+         ++prototypeIndex) {
+        const std::vector<size_t>& instanceIndices =
+          instancesByPrototype[prototypeIndex];
+        if (instanceIndices.empty()) {
+            continue;
+        }
+        const UsdPrim prototype = stage->GetPrimAtPath(prototypePaths[prototypeIndex]);
+        if (!prototype) {
+            TF_WARN("Point instancer <%s> references missing prototype <%s>.",
+                    instancer.GetPath().GetText(),
+                    prototypePaths[prototypeIndex].GetText());
+            return false;
+        }
+
+        UsdPrimRange range(prototype, UsdTraverseInstanceProxies());
+        for (auto iterator = range.begin(); iterator != range.end(); ++iterator) {
+            const UsdPrim prim = *iterator;
+            if (!isVisible(prim, time)) {
+                iterator.PruneChildren();
+                continue;
+            }
+            if (prim.IsA<UsdGeomPointInstancer>()) {
+                TF_WARN("Nested point instancer <%s> is not yet supported.",
+                        prim.GetPath().GetText());
+                iterator.PruneChildren();
+                continue;
+            }
+            const bool isMesh = prim.IsA<UsdGeomMesh>();
+            const bool isAnalytic =
+              prim.IsA<UsdGeomCube>() || prim.IsA<UsdGeomSphere>() ||
+              prim.IsA<UsdGeomCylinder>() || prim.IsA<UsdGeomCone>();
+            if (!isMesh && !isAnalytic) {
+                if (prim.IsA<UsdGeomGprim>()) {
+                    TF_WARN("Skipping unsupported point-instanced geometry <%s>.",
+                            prim.GetPath().GetText());
+                }
+                continue;
+            }
+
+            bool resetsXformStack = false;
+            const GfMatrix4d prototypeRelative =
+              xformCache.ComputeRelativeTransform(
+                prim, prototype, &resetsXformStack);
+            if (resetsXformStack) {
+                TF_WARN("Skipping point-instanced mesh <%s> with a reset transform stack.",
+                        prim.GetPath().GetText());
+                continue;
+            }
+
+            NodeData sourceNode;
+            sourceNode.path = prim.GetPath();
+            sourceNode.name = displayName(prim, "Prototype");
+            sourceNode.parentId = nodeId;
+            scene.nodes.push_back(std::move(sourceNode));
+            const uint32_t sourceNodeId =
+              static_cast<uint32_t>(scene.nodes.size());
+
+            const std::string cacheSuffix =
+              "|pointInstancer:" + instancer.GetPath().GetString() +
+              "|placement:" + prim.GetPath().GetString();
+            ThinInstanceData batch;
+            if (isMesh) {
+                if (!extractMesh(UsdGeomMesh(prim),
+                                 sourceNodeId,
+                                 scene,
+                                 nullptr,
+                                 &batch.sourceIndex,
+                                 cacheSuffix,
+                                 time)) {
+                    return false;
+                }
+            } else {
+                batch.analyticSource = true;
+                if (!extractAnalyticPrimitive(
+                      prim,
+                      sourceNodeId,
+                      scene,
+                      &batch.sourceIndex,
+                      cacheSuffix,
+                      time)) {
+                    return false;
+                }
+            }
+
+            batch.transforms.reserve(instanceIndices.size());
+            for (const size_t instanceIndex : instanceIndices) {
+                batch.transforms.emplace_back(
+                  prototypeRelative * instanceTransforms[instanceIndex]);
+            }
+            scene.thinInstances.push_back(std::move(batch));
+        }
+    }
+    return true;
 }
 
 PrimitiveAxis
@@ -1579,7 +1844,9 @@ primitiveAxis(const TfToken& axis)
 }
 
 uint32_t
-analyticMaterialId(SceneData& scene, const UsdPrim& prim)
+analyticMaterialId(SceneData& scene,
+                   const UsdPrim& prim,
+                   const UsdTimeCode time)
 {
     const uint32_t bound = boundMaterialId(scene, prim);
     if (bound != 0) {
@@ -1594,9 +1861,9 @@ analyticMaterialId(SceneData& scene, const UsdPrim& prim)
     }
     const UsdGeomGprim gprim(prim);
     const PrimvarData<GfVec3f> color =
-      readAuthoredPrimvar<GfVec3f>(gprim.GetDisplayColorPrimvar());
+      readAuthoredPrimvar<GfVec3f>(gprim.GetDisplayColorPrimvar(), time);
     const PrimvarData<float> opacity =
-      readAuthoredPrimvar<float>(gprim.GetDisplayOpacityPrimvar());
+      readAuthoredPrimvar<float>(gprim.GetDisplayOpacityPrimvar(), time);
     if (!color && !opacity) {
         scene.analyticMaterialIds.emplace(key, 0);
         return 0;
@@ -1641,22 +1908,27 @@ analyticMaterialId(SceneData& scene, const UsdPrim& prim)
 }
 
 bool
-extractAnalyticPrimitive(const UsdPrim& prim, uint32_t nodeId, SceneData& scene)
+extractAnalyticPrimitive(const UsdPrim& prim,
+                         uint32_t nodeId,
+                         SceneData& scene,
+                         size_t* primitiveIndexOut,
+                         const std::string& cacheSuffix,
+                         const UsdTimeCode time)
 {
     AnalyticPrimitiveData primitive;
     primitive.name = displayName(prim, "Primitive");
     primitive.nodeIds.push_back(nodeId);
-    primitive.materialId = analyticMaterialId(scene, prim);
+    primitive.materialId = analyticMaterialId(scene, prim, time);
 
     if (prim.IsA<UsdGeomCube>()) {
         double size = 2.0;
-        UsdGeomCube(prim).GetSizeAttr().Get(&size, UsdTimeCode::Default());
+        UsdGeomCube(prim).GetSizeAttr().Get(&size, time);
         primitive.type = AnalyticPrimitiveType::Cube;
         primitive.sizeOrRadius = static_cast<float>(size);
         primitive.tessellation = 0;
     } else if (prim.IsA<UsdGeomSphere>()) {
         double radius = 1.0;
-        UsdGeomSphere(prim).GetRadiusAttr().Get(&radius, UsdTimeCode::Default());
+        UsdGeomSphere(prim).GetRadiusAttr().Get(&radius, time);
         primitive.type = AnalyticPrimitiveType::Sphere;
         primitive.sizeOrRadius = static_cast<float>(radius);
     } else if (prim.IsA<UsdGeomCylinder>()) {
@@ -1664,9 +1936,9 @@ extractAnalyticPrimitive(const UsdPrim& prim, uint32_t nodeId, SceneData& scene)
         double height = 2.0;
         TfToken axis = UsdGeomTokens->z;
         const UsdGeomCylinder cylinder(prim);
-        cylinder.GetRadiusAttr().Get(&radius, UsdTimeCode::Default());
-        cylinder.GetHeightAttr().Get(&height, UsdTimeCode::Default());
-        cylinder.GetAxisAttr().Get(&axis, UsdTimeCode::Default());
+        cylinder.GetRadiusAttr().Get(&radius, time);
+        cylinder.GetHeightAttr().Get(&height, time);
+        cylinder.GetAxisAttr().Get(&axis, time);
         primitive.type = AnalyticPrimitiveType::Cylinder;
         primitive.axis = primitiveAxis(axis);
         primitive.sizeOrRadius = static_cast<float>(radius);
@@ -1676,9 +1948,9 @@ extractAnalyticPrimitive(const UsdPrim& prim, uint32_t nodeId, SceneData& scene)
         double height = 2.0;
         TfToken axis = UsdGeomTokens->z;
         const UsdGeomCone cone(prim);
-        cone.GetRadiusAttr().Get(&radius, UsdTimeCode::Default());
-        cone.GetHeightAttr().Get(&height, UsdTimeCode::Default());
-        cone.GetAxisAttr().Get(&axis, UsdTimeCode::Default());
+        cone.GetRadiusAttr().Get(&radius, time);
+        cone.GetHeightAttr().Get(&height, time);
+        cone.GetAxisAttr().Get(&axis, time);
         primitive.type = AnalyticPrimitiveType::Cone;
         primitive.axis = primitiveAxis(axis);
         primitive.sizeOrRadius = static_cast<float>(radius);
@@ -1698,8 +1970,8 @@ extractAnalyticPrimitive(const UsdPrim& prim, uint32_t nodeId, SceneData& scene)
     const UsdGeomGprim gprim(prim);
     bool doubleSided = false;
     TfToken orientation = UsdGeomTokens->rightHanded;
-    gprim.GetDoubleSidedAttr().Get(&doubleSided, UsdTimeCode::Default());
-    gprim.GetOrientationAttr().Get(&orientation, UsdTimeCode::Default());
+    gprim.GetDoubleSidedAttr().Get(&doubleSided, time);
+    gprim.GetOrientationAttr().Get(&orientation, time);
     primitive.flags = doubleSided ? MeshDoubleSided : 0;
     primitive.flags |= orientation == UsdGeomTokens->leftHanded ? MeshLeftHanded : 0;
     const UsdPrim source = prim.IsInstanceProxy() ? prim.GetPrimInPrototype() : prim;
@@ -1709,14 +1981,22 @@ extractAnalyticPrimitive(const UsdPrim& prim, uint32_t nodeId, SceneData& scene)
       sourcePath + "|" + std::to_string(static_cast<uint32_t>(primitive.type)) + "|" +
       std::to_string(primitive.materialId) + "|" + std::to_string(primitive.flags) + "|" +
       std::to_string(static_cast<uint32_t>(primitive.axis)) + "|" +
-      std::to_string(primitive.sizeOrRadius) + "|" + std::to_string(primitive.height);
+      std::to_string(primitive.sizeOrRadius) + "|" + std::to_string(primitive.height) +
+      cacheSuffix;
     const auto cachedPrimitive = scene.analyticPrimitiveIds.find(key);
     if (cachedPrimitive != scene.analyticPrimitiveIds.end()) {
         scene.analyticPrimitives[cachedPrimitive->second].nodeIds.push_back(nodeId);
+        if (primitiveIndexOut) {
+            *primitiveIndexOut = cachedPrimitive->second;
+        }
         return true;
     }
-    scene.analyticPrimitiveIds.emplace(key, scene.analyticPrimitives.size());
+    const size_t primitiveIndex = scene.analyticPrimitives.size();
+    scene.analyticPrimitiveIds.emplace(key, primitiveIndex);
     scene.analyticPrimitives.push_back(std::move(primitive));
+    if (primitiveIndexOut) {
+        *primitiveIndexOut = primitiveIndex;
+    }
     return true;
 }
 
@@ -1728,8 +2008,12 @@ extractStage(const UsdStageRefPtr& stage, SceneData& scene)
     scene.timeCodesPerSecond = stage->GetTimeCodesPerSecond();
     collectSkeletonBindings(stage, scene);
 
-    for (const UsdPrim& prim : stage->Traverse(UsdTraverseInstanceProxies())) {
-        if (!isVisible(prim)) {
+    UsdPrimRange range = stage->Traverse(UsdTraverseInstanceProxies());
+    for (auto iterator = range.begin(); iterator != range.end(); ++iterator) {
+        const UsdPrim prim = *iterator;
+        const bool isPointInstancer = prim.IsA<UsdGeomPointInstancer>();
+        if (!isPointInstancer && !isVisible(prim)) {
+            iterator.PruneChildren();
             continue;
         }
         const UsdGeomXformable xformable(prim);
@@ -1742,6 +2026,14 @@ extractStage(const UsdStageRefPtr& stage, SceneData& scene)
         if (nodeId == kMissingOffset) {
             continue;
         }
+        if (isPointInstancer) {
+            if (!extractPointInstancer(
+                  UsdGeomPointInstancer(prim), nodeId, scene)) {
+                return false;
+            }
+            iterator.PruneChildren();
+            continue;
+        }
         if (prim.IsA<UsdGeomMesh>()) {
             const auto skin = scene.skinBindings.find(prim.GetPath().GetString());
             if (!extractMesh(UsdGeomMesh(prim),
@@ -1751,7 +2043,8 @@ extractStage(const UsdStageRefPtr& stage, SceneData& scene)
                 return false;
             }
         } else {
-            extractAnalyticPrimitive(prim, nodeId, scene);
+            extractAnalyticPrimitive(
+              prim, nodeId, scene, nullptr, {}, UsdTimeCode::Default());
         }
     }
     return true;
@@ -2268,6 +2561,28 @@ packScene(const SceneData& scene, SceneBuffers& result)
             commands.end(instanceRecord);
             ++result.instanceCount;
         }
+    }
+
+    for (const ThinInstanceData& batch : scene.thinInstances) {
+        if (batch.transforms.empty()) {
+            continue;
+        }
+        data.align();
+        const uint32_t transformsOffset = data.size();
+        for (const GfMatrix4d& transform : batch.transforms) {
+            appendMatrix(data, transform);
+        }
+        const uint32_t sourceId =
+          batch.analyticSource
+            ? static_cast<uint32_t>(
+                scene.meshes.size() + batch.sourceIndex + 1)
+            : static_cast<uint32_t>(batch.sourceIndex + 1);
+        const uint32_t record = commands.begin(Command::ThinInstances);
+        commands.buffer.u32(sourceId);
+        commands.buffer.u32(transformsOffset);
+        commands.buffer.u32(static_cast<uint32_t>(batch.transforms.size()));
+        commands.end(record);
+        result.instanceCount += batch.transforms.size();
     }
 
     for (size_t nodeIndex = 0; nodeIndex < scene.nodes.size(); ++nodeIndex) {

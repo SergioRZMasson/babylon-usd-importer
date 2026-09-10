@@ -12,6 +12,7 @@ node test/smoke.mjs
 - full affine/shear transform preservation;
 - matrix animation;
 - distinct skeleton rest and bind poses;
+- single-frame time-sampled point instancers, prototype transforms, and instance masks;
 - instance-proxy geometry reuse;
 - analytic-gprim instance reuse;
 - explicit left-handed mesh orientation.

@@ -28,6 +28,7 @@ import { CreateCylinder } from "@babylonjs/core/Meshes/Builders/cylinderBuilder.
 import { CreateSphere } from "@babylonjs/core/Meshes/Builders/sphereBuilder.js";
 import { Mesh } from "@babylonjs/core/Meshes/mesh.js";
 import "@babylonjs/core/Meshes/instancedMesh.js";
+import "@babylonjs/core/Meshes/thinInstanceMesh.js";
 import { SubMesh } from "@babylonjs/core/Meshes/subMesh.js";
 import { TransformNode } from "@babylonjs/core/Meshes/transformNode.js";
 import { VertexData } from "@babylonjs/core/Meshes/mesh.vertexData.js";
@@ -252,6 +253,8 @@ export async function materializeCommandBuffers(
     const bones = new Map<number, Bone>();
     const geometries = new Map<number, GeometryDescriptor>();
     const meshes = new Map<number, Mesh>();
+    const classicInstanceSources = new Set<number>();
+    const thinInstanceSources = new Set<number>();
     const animationGroups = new Map<number, AnimationGroup>();
     const textureLoads: Promise<void>[] = [];
     let root: TransformNode | undefined;
@@ -1422,11 +1425,56 @@ export async function materializeCommandBuffers(
                             `Instance references missing mesh ${sourceId}.`,
                         );
                     }
+                    if (thinInstanceSources.has(sourceId)) {
+                        throw new Error(
+                            `Mesh ${sourceId} cannot mix classic and thin instances.`,
+                        );
+                    }
+                    classicInstanceSources.add(sourceId);
                     const instance = source.createInstance(
                         stringAt(dataBuffer, nameOffset, nameLength),
                     );
                     instance.parent = nodes.get(nodeId) ?? root ?? null;
                     container.meshes.push(instance);
+                    break;
+                }
+                case Command.ThinInstances: {
+                    const sourceId = payload.u32();
+                    const transformsOffset = payload.u32();
+                    const instanceCount = payload.u32();
+                    const source = meshes.get(sourceId);
+                    if (!source) {
+                        throw new Error(
+                            `Thin instances reference missing mesh ${sourceId}.`,
+                        );
+                    }
+                    if (
+                        thinInstanceSources.has(sourceId) ||
+                        classicInstanceSources.has(sourceId)
+                    ) {
+                        throw new Error(
+                            `Mesh ${sourceId} has duplicate or mixed thin instances.`,
+                        );
+                    }
+                    assertRange(
+                        dataBuffer,
+                        transformsOffset,
+                        instanceCount * 16,
+                        4,
+                        "thin instance transforms",
+                    );
+                    source.thinInstanceSetBuffer(
+                        "matrix",
+                        new Float32Array(
+                            dataBuffer,
+                            transformsOffset,
+                            instanceCount * 16,
+                        ),
+                        16,
+                        true,
+                    );
+                    source.thinInstanceEnablePicking = true;
+                    thinInstanceSources.add(sourceId);
                     break;
                 }
                 case Command.Animation: {

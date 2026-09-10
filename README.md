@@ -105,7 +105,8 @@ relationships.
 - Shared packed metallic/roughness/occlusion images and separately authored scalar maps.
 - `UsdUVTexture` output-channel selection, source color space, float4 scale/bias, and UV
   transforms.
-- Shared source geometry and Babylon instances.
+- Shared source geometry, Babylon instances, and static `UsdGeomPointInstancer`
+  batches backed by thin-instance matrix buffers.
 - Up to eight skinning influences.
 - Skeletons, node animation, and skeletal animation.
 
@@ -117,8 +118,9 @@ relationships.
 - Browser-unsupported image formats require native transcoding.
 - Only `UsdUVTexture` image nodes and `UsdTransform2d`/`UsdPrimvarReader_float2` UV networks
   are translated; unsupported shader nodes are reported and ignored.
-- Blend shapes, point instancers, cameras, lights, physics, and runtime
-  variant switching are not yet represented by the command protocol.
+- Animated point-instancer attributes are currently sampled at their first authored frame.
+- Blend shapes, nested point instancers, cameras, lights, physics, and runtime variant
+  switching are not yet represented by the command protocol.
 - Analytic primitive dimensions are currently sampled at the default time.
 - Babylon object construction runs on the main thread after worker extraction.
 
@@ -167,7 +169,9 @@ The current little-endian command protocol is version 4. Skeleton joint records 
 separate local rest and bind matrices. Texture payloads are 48 bytes
 (ten existing `u32` fields, source color space, and an offset to float4 scale plus float4
 bias). Material payloads are 96 bytes and carry seven texture IDs followed by seven output
-channels in base, opacity, normal, metallic, roughness, occlusion, emissive order.
+channels in base, opacity, normal, metallic, roughness, occlusion, emissive order. A
+12-byte thin-instance command references one source mesh and a contiguous array of
+row-major float4x4 transforms in the shared data buffer.
 
 ## Repository layout
 

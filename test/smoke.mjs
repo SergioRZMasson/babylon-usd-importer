@@ -53,6 +53,7 @@ function commandRecords(result) {
         [8, 16],
         [9, 32],
         [10, 44],
+        [11, 12],
     ]);
     const records = [];
     let offset = 16;
@@ -150,6 +151,98 @@ try {
 } finally {
     bindPoseResult.delete();
     module.FS.unlink(bindPosePath);
+}
+
+const pointInstancerPath = "/test/point-instancer.usda";
+module.FS.writeFile(
+    pointInstancerPath,
+    await readFile(resolve(root, "test", "assets", "point-instancer.usda")),
+);
+const pointInstancerResult = module.extract(pointInstancerPath);
+try {
+    if (!pointInstancerResult.ok()) {
+        throw new Error(pointInstancerResult.error());
+    }
+    const { view, records } = commandRecords(pointInstancerResult);
+    const batch = records.find((record) => record.opcode === 11);
+    if (
+        pointInstancerResult.meshCount() !== 1 ||
+        pointInstancerResult.instanceCount() !== 2 ||
+        !batch ||
+        view.getUint32(batch.offset, true) !== 1 ||
+        view.getUint32(batch.offset + 8, true) !== 2
+    ) {
+        throw new Error("PointInstancer was not emitted as one thin-instance batch.");
+    }
+    const data = module.HEAPU8.slice(
+        pointInstancerResult.dataPtr(),
+        pointInstancerResult.dataPtr() + pointInstancerResult.dataSize(),
+    );
+    const dataView = new DataView(data.buffer);
+    const transformsOffset = view.getUint32(batch.offset + 4, true);
+    const transforms = new Float32Array(
+        data.buffer,
+        transformsOffset,
+        32,
+    );
+    const instancerNode = records.find((record) => {
+        if (record.opcode !== 4) {
+            return false;
+        }
+        const nameOffset = view.getUint32(record.offset + 8, true);
+        const nameLength = view.getUint32(record.offset + 12, true);
+        return (
+            new TextDecoder().decode(
+                data.subarray(nameOffset, nameOffset + nameLength),
+            ) === "Scatter"
+        );
+    });
+    const instancerMatrixOffset = instancerNode
+        ? view.getUint32(instancerNode.offset + 16, true)
+        : 0;
+    if (
+        !instancerNode ||
+        Math.abs(dataView.getFloat32(instancerMatrixOffset + 48, true) - 100) >
+            1e-6 ||
+        Math.abs(transforms[12] - 11) > 1e-6 ||
+        Math.abs(transforms[13] - 2) > 1e-6 ||
+        Math.abs(transforms[28] - 31) > 1e-6 ||
+        Math.abs(transforms[29] - 2) > 1e-6
+    ) {
+        throw new Error(
+            "PointInstancer prototype, descendant, mask, or placement transforms were lost: " +
+                `${transforms[12]},${transforms[13]} and ${transforms[28]},${transforms[29]}.`,
+        );
+    }
+} finally {
+    pointInstancerResult.delete();
+    module.FS.unlink(pointInstancerPath);
+}
+
+const pointInstancerIdsPath = "/test/point-instancer-ids.usda";
+module.FS.writeFile(
+    pointInstancerIdsPath,
+    await readFile(resolve(root, "test", "assets", "point-instancer-ids.usda")),
+);
+const pointInstancerIdsResult = module.extract(pointInstancerIdsPath);
+try {
+    if (!pointInstancerIdsResult.ok()) {
+        throw new Error(pointInstancerIdsResult.error());
+    }
+    const { view, records } = commandRecords(pointInstancerIdsResult);
+    const batch = records.find((record) => record.opcode === 11);
+    if (
+        !batch ||
+        pointInstancerIdsResult.instanceCount() !== 2 ||
+        view.getUint32(batch.offset + 8, true) !== 2
+    ) {
+        throw new Error(
+            "Time-sampled PointInstancer ids were not used for instance masking.",
+        );
+    }
+} finally {
+    pointInstancerIdsResult.delete();
+    module.FS.unlink(pointInstancerIdsPath);
 }
 
 const textureFixturePath = "/test/material-textures.usda";

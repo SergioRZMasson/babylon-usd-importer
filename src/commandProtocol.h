@@ -20,6 +20,7 @@ enum class Command : uint16_t
     Instance = 8,
     Animation = 9,
     AnalyticPrimitive = 10,
+    ThinInstances = 11,
 };
 
 enum class AnalyticPrimitiveType : uint32_t
