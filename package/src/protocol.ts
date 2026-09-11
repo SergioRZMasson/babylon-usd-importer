@@ -13,6 +13,8 @@ export const enum Command {
     Instance = 8,
     Animation = 9,
     AnalyticPrimitive = 10,
+    ThinInstances = 11,
+    MorphTarget = 12,
 }
 
 export const enum AnalyticPrimitiveType {
@@ -31,6 +33,7 @@ export const enum PrimitiveAxis {
 export const enum AnimationTarget {
     Node = 0,
     Bone = 1,
+    MorphTarget = 2,
 }
 
 export const enum AnimationProperty {
@@ -38,12 +41,27 @@ export const enum AnimationProperty {
     RotationQuaternion = 1,
     Scaling = 2,
     Matrix = 3,
+    Influence = 4,
 }
 
 export const enum MaterialFlags {
     DoubleSided = 1 << 0,
     Unlit = 1 << 1,
     AlphaBlend = 1 << 2,
+}
+
+export const enum TextureSourceColorSpace {
+    Auto = 0,
+    Raw = 1,
+    SRGB = 2,
+}
+
+export const enum TextureOutputChannel {
+    R = 0,
+    G = 1,
+    B = 2,
+    A = 3,
+    RGB = 4,
 }
 
 export const enum MeshFlags {
@@ -72,9 +90,9 @@ function expectedPayloadLength(opcode: Command): number {
         case Command.Scene:
             return 12;
         case Command.Texture:
-            return 40;
+            return 48;
         case Command.Material:
-            return 76;
+            return 96;
         case Command.TransformNode:
         case Command.Skeleton:
             return 20;
@@ -88,8 +106,14 @@ function expectedPayloadLength(opcode: Command): number {
             return 32;
         case Command.AnalyticPrimitive:
             return 44;
+        case Command.ThinInstances:
+            return 12;
+        case Command.MorphTarget:
+            return 32;
         default:
-            throw new Error(`Unknown OpenUSD Babylon command opcode ${opcode}.`);
+            throw new Error(
+                `Unknown OpenUSD Babylon command opcode ${opcode}.`,
+            );
     }
 }
 
@@ -99,7 +123,9 @@ export function readCommands(buffer: ArrayBuffer): CommandRecord[] {
         throw new Error("Invalid OpenUSD Babylon command buffer.");
     }
     if (view.getUint16(4, true) !== PROTOCOL_VERSION) {
-        throw new Error(`Unsupported OpenUSD Babylon protocol ${view.getUint16(4, true)}.`);
+        throw new Error(
+            `Unsupported OpenUSD Babylon protocol ${view.getUint16(4, true)}.`,
+        );
     }
     const count = view.getUint32(8, true);
     const commands: CommandRecord[] = [];
@@ -126,7 +152,9 @@ export function readCommands(buffer: ArrayBuffer): CommandRecord[] {
         offset = payloadOffset + payloadLength;
     }
     if (offset !== view.byteLength) {
-        throw new Error("Unexpected trailing data in OpenUSD Babylon command buffer.");
+        throw new Error(
+            "Unexpected trailing data in OpenUSD Babylon command buffer.",
+        );
     }
     return commands;
 }
@@ -158,7 +186,9 @@ export class PayloadReader {
 
     #require(byteLength: number): void {
         if (this.offset + byteLength > this.#end) {
-            throw new Error("OpenUSD Babylon command payload read exceeded its bounds.");
+            throw new Error(
+                "OpenUSD Babylon command payload read exceeded its bounds.",
+            );
         }
     }
 }

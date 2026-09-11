@@ -101,20 +101,29 @@ relationships.
 - Material binding subsets.
 - Exact vertex welding and indexed geometry.
 - `UsdPreviewSurface`, `UsdUVTexture`, `UsdTransform2d`, and primvar readers.
-- PBR base color, opacity, metallic/roughness packing, normal, emissive, and UV transforms.
-- Shared source geometry and Babylon instances.
+- PBR base color, opacity, normal, metallic, roughness, occlusion, and emissive textures.
+- Shared packed metallic/roughness/occlusion images and separately authored scalar maps.
+- `UsdUVTexture` output-channel selection, source color space, float4 scale/bias, and UV
+  transforms.
+- Shared source geometry, Babylon instances, and static `UsdGeomPointInstancer`
+  batches backed by thin-instance matrix buffers.
 - Up to eight skinning influences.
-- Skeletons, node animation, and skeletal animation.
+- Skeletons, node animation, and skeletal animation, with skinned geometry placed in its
+  bound Skeleton space after applying `geomBindTransform`.
+- Sparse USD blend shapes, authored normal offsets, in-between shapes, and animated
+  blend-shape weights materialized through Babylon morph targets.
 
 ## Current limitations
 
 - Polygon triangulation is a convex fan; concave n-gons need a more robust triangulator.
 - Only one UV stream is currently emitted per mesh.
-- Separately authored metallic and roughness textures are not repacked yet.
 - MaterialX, MDL, OpenPBR, and other surface models fall back explicitly.
 - Browser-unsupported image formats require native transcoding.
-- Blend shapes, point instancers, cameras, lights, physics, and runtime
-  variant switching are not yet represented by the command protocol.
+- Only `UsdUVTexture` image nodes and `UsdTransform2d`/`UsdPrimvarReader_float2` UV networks
+  are translated; unsupported shader nodes are reported and ignored.
+- Animated point-instancer attributes are currently sampled at their first authored frame.
+- Nested point instancers, cameras, lights, physics, and runtime variant switching are not
+  yet represented by the command protocol.
 - Analytic primitive dimensions are currently sampled at the default time.
 - Babylon object construction runs on the main thread after worker extraction.
 
@@ -158,6 +167,16 @@ Run the Node/Emscripten protocol smoke test:
 ```sh
 node test/smoke.mjs
 ```
+
+The current little-endian command protocol is version 4. Skeleton joint records preserve
+separate local rest and bind matrices. Texture payloads are 48 bytes
+(ten existing `u32` fields, source color space, and an offset to float4 scale plus float4
+bias). Material payloads are 96 bytes and carry seven texture IDs followed by seven output
+channels in base, opacity, normal, metallic, roughness, occlusion, emissive order. A
+12-byte thin-instance command references one source mesh and a contiguous array of
+row-major float4x4 transforms in the shared data buffer. A 32-byte morph-target command
+references full post-weld target positions, optional normals, and an initial influence;
+scalar animation records drive morph influences and preserve USD in-between interpolation.
 
 ## Repository layout
 

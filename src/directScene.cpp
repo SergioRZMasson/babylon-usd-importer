@@ -23,11 +23,13 @@
 #include <pxr/usd/usdGeom/cylinder.h>
 #include <pxr/usd/usdGeom/mesh.h>
 #include <pxr/usd/usdGeom/metrics.h>
+#include <pxr/usd/usdGeom/pointInstancer.h>
 #include <pxr/usd/usdGeom/primvar.h>
 #include <pxr/usd/usdGeom/primvarsAPI.h>
 #include <pxr/usd/usdGeom/subset.h>
 #include <pxr/usd/usdGeom/sphere.h>
 #include <pxr/usd/usdGeom/tokens.h>
+#include <pxr/usd/usdGeom/xformCache.h>
 #include <pxr/usd/usdGeom/xformable.h>
 #include <pxr/usd/usdShade/connectableAPI.h>
 #include <pxr/usd/usdShade/input.h>
@@ -36,12 +38,18 @@
 #include <pxr/usd/usdShade/shader.h>
 #include <pxr/usd/usdShade/tokens.h>
 #include <pxr/usd/usdSkel/animQuery.h>
+#include <pxr/usd/usdSkel/animMapper.h>
+#include <pxr/usd/usdSkel/animation.h>
 #include <pxr/usd/usdSkel/binding.h>
+#include <pxr/usd/usdSkel/bindingAPI.h>
+#include <pxr/usd/usdSkel/blendShapeQuery.h>
 #include <pxr/usd/usdSkel/cache.h>
 #include <pxr/usd/usdSkel/root.h>
+#include <pxr/usd/usdSkel/skeleton.h>
 #include <pxr/usd/usdSkel/skeletonQuery.h>
 #include <pxr/usd/usdSkel/skinningQuery.h>
 #include <pxr/usd/usdSkel/topology.h>
+#include <pxr/usd/usdSkel/utils.h>
 
 #include <algorithm>
 #include <array>
@@ -167,13 +175,17 @@ public:
 struct TextureData
 {
     SdfAssetPath asset;
+    SdfPath sourceShader;
     std::string name;
     TfToken channel;
+    TfToken sourceColorSpace = TfToken("auto");
     TfToken wrapS = TfToken("repeat");
     TfToken wrapT = TfToken("repeat");
-    GfVec2f scale = GfVec2f(1.0f);
-    GfVec2f translation = GfVec2f(0.0f);
+    GfVec2f uvScale = GfVec2f(1.0f);
+    GfVec2f uvTranslation = GfVec2f(0.0f);
     float rotation = 0.0f;
+    GfVec4f valueScale = GfVec4f(1.0f);
+    GfVec4f valueBias = GfVec4f(0.0f);
     int uvIndex = 0;
     TfToken uvName = TfToken("st");
 
@@ -195,12 +207,17 @@ struct MaterialData
     TextureData baseTexture;
     TextureData opacityTexture;
     TextureData normalTexture;
-    TextureData ormTexture;
+    TextureData metallicTexture;
+    TextureData roughnessTexture;
+    TextureData occlusionTexture;
     TextureData emissiveTexture;
+    uint32_t baseChannel = kMissingOffset;
     uint32_t opacityChannel = kMissingOffset;
-    uint32_t roughnessChannel = kMissingOffset;
+    uint32_t normalChannel = kMissingOffset;
     uint32_t metallicChannel = kMissingOffset;
+    uint32_t roughnessChannel = kMissingOffset;
     uint32_t occlusionChannel = kMissingOffset;
+    uint32_t emissiveChannel = kMissingOffset;
 };
 
 struct NodeAnimation
@@ -225,6 +242,31 @@ struct SubmeshData
     uint32_t indexCount = 0;
 };
 
+struct MorphTargetAnimation
+{
+    std::vector<float> times;
+    std::vector<float> influences;
+};
+
+struct MorphTargetData
+{
+    std::string name;
+    float influence = 0.0f;
+    std::vector<GfVec3f> pointOffsets;
+    std::vector<GfVec3f> normalOffsets;
+    std::vector<GfVec3f> positions;
+    std::vector<GfVec3f> normals;
+    MorphTargetAnimation animation;
+};
+
+struct SourceMorphTarget
+{
+    MorphTargetData target;
+    size_t subShapeIndex = 0;
+    std::vector<GfVec3f> pointOffsets;
+    std::vector<GfVec3f> normalOffsets;
+};
+
 using JointSet = std::array<uint16_t, kMaxInfluences>;
 using WeightSet = std::array<float, kMaxInfluences>;
 
@@ -241,8 +283,10 @@ struct MeshData
     std::vector<GfVec4f> colors;
     std::vector<JointSet> joints;
     std::vector<WeightSet> weights;
+    std::vector<uint32_t> sourcePointIndices;
     std::vector<uint32_t> indices;
     std::vector<SubmeshData> submeshes;
+    std::vector<MorphTargetData> morphTargets;
     std::vector<uint32_t> nodeIds;
 };
 
@@ -271,12 +315,21 @@ struct SkeletonData
     VtTokenArray joints;
     VtIntArray parents;
     VtMatrix4dArray restTransforms;
+    VtMatrix4dArray bindTransforms;
     SkeletonAnimation animation;
+};
+
+struct ThinInstanceData
+{
+    size_t sourceIndex = 0;
+    bool analyticSource = false;
+    std::vector<GfMatrix4d> transforms;
 };
 
 struct SkinBinding
 {
     uint32_t skeletonId = kMissingOffset;
+    SdfPath skeletonPath;
     UsdSkelSkinningQuery query;
     std::vector<uint16_t> jointMap;
 };
@@ -293,6 +346,7 @@ struct SceneData
     std::vector<MeshData> meshes;
     std::unordered_map<std::string, size_t> meshIds;
     std::unordered_map<std::string, bool> meshWinding;
+    std::vector<ThinInstanceData> thinInstances;
     std::vector<AnalyticPrimitiveData> analyticPrimitives;
     std::unordered_map<std::string, size_t> analyticPrimitiveIds;
     std::unordered_map<std::string, uint32_t> analyticMaterialIds;
@@ -413,8 +467,8 @@ readUvConnection(const UsdShadeShader& textureShader, TextureData& texture)
     TfToken sourceId;
     source.GetShaderId(&sourceId);
     if (sourceId == TfToken("UsdTransform2d")) {
-        getInputValue(source, "scale", texture.scale);
-        getInputValue(source, "translation", texture.translation);
+        getInputValue(source, "scale", texture.uvScale);
+        getInputValue(source, "translation", texture.uvTranslation);
         float rotationDegrees = 0.0f;
         if (getInputValue(source, "rotation", rotationDegrees)) {
             texture.rotation =
@@ -433,7 +487,30 @@ readUvConnection(const UsdShadeShader& textureShader, TextureData& texture)
         }
         texture.uvName = varname;
         texture.uvIndex = 0;
+    } else {
+        TF_WARN("Ignoring unsupported UV source shader '%s' at <%s>.",
+                sourceId.GetText(),
+                source.GetPath().GetText());
     }
+}
+
+TfToken
+normalizedSourceColorSpace(const TfToken& authored)
+{
+    std::string normalized = TfStringToLower(authored.GetString());
+    normalized.erase(std::remove_if(normalized.begin(),
+                                    normalized.end(),
+                                    [](char value) {
+                                        return value == '-' || value == '_';
+                                    }),
+                     normalized.end());
+    if (normalized == "raw") {
+        return TfToken("raw");
+    }
+    if (normalized == "srgb") {
+        return TfToken("sRGB");
+    }
+    return TfToken("auto");
 }
 
 TextureData
@@ -448,32 +525,27 @@ readTexture(const UsdShadeInput& materialInput)
     TfToken shaderId;
     shader.GetShaderId(&shaderId);
     if (shaderId != TfToken("UsdUVTexture")) {
+        TF_WARN("Ignoring texture connection from unsupported shader '%s' at <%s>.",
+                shaderId.GetText(),
+                shader.GetPath().GetText());
         return result;
     }
     if (!getInputValue(shader, "file", result.asset) || result.asset.GetAssetPath().empty()) {
         return {};
     }
+    result.sourceShader = shader.GetPath();
     result.name = TfGetBaseName(result.asset.GetAssetPath());
     result.channel = outputName;
+    TfToken sourceColorSpace;
+    if (getTokenInput(shader, "sourceColorSpace", sourceColorSpace)) {
+        result.sourceColorSpace = normalizedSourceColorSpace(sourceColorSpace);
+    }
+    getInputValue(shader, "scale", result.valueScale);
+    getInputValue(shader, "bias", result.valueBias);
     getTokenInput(shader, "wrapS", result.wrapS);
     getTokenInput(shader, "wrapT", result.wrapT);
     readUvConnection(shader, result);
     return result;
-}
-
-bool
-sameTexture(const TextureData& left, const TextureData& right)
-{
-    if (!left || !right) {
-        return false;
-    }
-    const std::string leftPath =
-      left.asset.GetResolvedPath().empty() ? left.asset.GetAssetPath()
-                                           : left.asset.GetResolvedPath();
-    const std::string rightPath =
-      right.asset.GetResolvedPath().empty() ? right.asset.GetAssetPath()
-                                            : right.asset.GetResolvedPath();
-    return leftPath == rightPath;
 }
 
 uint32_t
@@ -491,7 +563,10 @@ textureChannel(const TfToken& channel)
     if (channel == TfToken("a")) {
         return 3;
     }
-    return 4;
+    if (channel == TfToken("rgb")) {
+        return 4;
+    }
+    return kMissingOffset;
 }
 
 std::optional<MaterialData>
@@ -518,65 +593,66 @@ readMaterial(const UsdShadeMaterial& material)
     getInputValue(shader, "roughness", result.roughness);
     getInputValue(shader, "opacity", result.opacity);
     getInputValue(shader, "opacityThreshold", result.alphaCutoff);
-    const float authoredOpacity = result.opacity;
 
     const UsdShadeInput baseInput = shader.GetInput(TfToken("diffuseColor"));
     const UsdShadeInput opacityInput = shader.GetInput(TfToken("opacity"));
     const UsdShadeInput metallicInput = shader.GetInput(TfToken("metallic"));
     const UsdShadeInput roughnessInput = shader.GetInput(TfToken("roughness"));
     const UsdShadeInput occlusionInput = shader.GetInput(TfToken("occlusion"));
-    result.baseTexture = readTexture(baseInput);
-    result.normalTexture = readTexture(shader.GetInput(TfToken("normal")));
-    result.emissiveTexture = readTexture(shader.GetInput(TfToken("emissiveColor")));
 
-    result.opacityTexture = readTexture(opacityInput);
-    if (result.opacityTexture) {
-        result.opacityChannel = textureChannel(result.opacityTexture.channel);
-        if (result.opacityChannel == 3) {
-            result.opacity = std::min(result.opacity, 0.999f);
-        } else {
-            TF_WARN("Ignoring opacity texture output '%s' on material <%s>; Babylon requires "
-                    "this baseline path to provide opacity in the alpha channel.",
-                    result.opacityTexture.channel.GetText(),
-                    material.GetPath().GetText());
-            result.opacityTexture = {};
-            result.opacityChannel = kMissingOffset;
+    auto readBinding = [&](const UsdShadeInput& input,
+                           TextureData& texture,
+                           uint32_t& channel,
+                           const char* slot) {
+        texture = readTexture(input);
+        if (!texture) {
+            return false;
         }
-    }
+        channel = textureChannel(texture.channel);
+        if (channel != kMissingOffset) {
+            return true;
+        }
+        TF_WARN("Ignoring %s texture on material <%s>: unsupported output '%s'.",
+                slot,
+                material.GetPath().GetText(),
+                texture.channel.GetText());
+        texture = {};
+        return false;
+    };
 
-    const TextureData metallicTexture = readTexture(metallicInput);
-    const TextureData roughnessTexture = readTexture(roughnessInput);
-    const TextureData occlusionTexture = readTexture(occlusionInput);
-    if (sameTexture(metallicTexture, roughnessTexture)) {
-        const uint32_t metallicChannel = textureChannel(metallicTexture.channel);
-        const uint32_t roughnessChannel = textureChannel(roughnessTexture.channel);
-        const bool supportedMetallic = metallicChannel == 0 || metallicChannel == 2;
-        const bool supportedRoughness = roughnessChannel == 1 || roughnessChannel == 3;
-        if (supportedMetallic && supportedRoughness) {
-            result.ormTexture = metallicTexture;
-            result.metallicChannel = metallicChannel;
-            result.roughnessChannel = roughnessChannel;
-            if (sameTexture(result.ormTexture, occlusionTexture) &&
-                textureChannel(occlusionTexture.channel) == 0) {
-                result.occlusionChannel = 0;
-            }
-        } else {
-            TF_WARN("Ignoring unsupported metallic/roughness channel layout on material <%s>.",
-                    material.GetPath().GetText());
-        }
-    } else if (metallicTexture || roughnessTexture) {
-        TF_WARN("Ignoring separately authored metallic and roughness textures on material <%s>; "
-                "the native baseline currently requires a shared packed texture.",
-                material.GetPath().GetText());
-    }
-    if (occlusionTexture && result.occlusionChannel == kMissingOffset) {
-        TF_WARN("Ignoring separate occlusion texture on material <%s> in the native direct "
-                "baseline.",
-                material.GetPath().GetText());
-    }
+    readBinding(baseInput,
+                result.baseTexture,
+                result.baseChannel,
+                "base-color");
+    readBinding(opacityInput,
+                result.opacityTexture,
+                result.opacityChannel,
+                "opacity");
+    readBinding(shader.GetInput(TfToken("normal")),
+                result.normalTexture,
+                result.normalChannel,
+                "normal");
+    readBinding(metallicInput,
+                result.metallicTexture,
+                result.metallicChannel,
+                "metallic");
+    readBinding(roughnessInput,
+                result.roughnessTexture,
+                result.roughnessChannel,
+                "roughness");
+    readBinding(occlusionInput,
+                result.occlusionTexture,
+                result.occlusionChannel,
+                "occlusion");
+    readBinding(shader.GetInput(TfToken("emissiveColor")),
+                result.emissiveTexture,
+                result.emissiveChannel,
+                "emissive");
 
     TfToken materialUv;
-    auto validateUv = [&](TextureData& texture, const char* slot) {
+    auto validateUv = [&](TextureData& texture,
+                          uint32_t& channel,
+                          const char* slot) {
         if (!texture) {
             return true;
         }
@@ -594,20 +670,30 @@ readMaterial(const UsdShadeMaterial& material)
                 texture.uvName.GetText(),
                 materialUv.GetText());
         texture = {};
+        channel = kMissingOffset;
         return false;
     };
-    validateUv(result.baseTexture, "base-color");
-    if (!validateUv(result.opacityTexture, "opacity")) {
-        result.opacityChannel = kMissingOffset;
-        result.opacity = authoredOpacity;
-    }
-    validateUv(result.normalTexture, "normal");
-    if (!validateUv(result.ormTexture, "metallic-roughness")) {
-        result.roughnessChannel = kMissingOffset;
-        result.metallicChannel = kMissingOffset;
-        result.occlusionChannel = kMissingOffset;
-    }
-    validateUv(result.emissiveTexture, "emissive");
+    validateUv(result.baseTexture,
+               result.baseChannel,
+               "base-color");
+    validateUv(result.opacityTexture,
+               result.opacityChannel,
+               "opacity");
+    validateUv(result.normalTexture,
+               result.normalChannel,
+               "normal");
+    validateUv(result.metallicTexture,
+               result.metallicChannel,
+               "metallic");
+    validateUv(result.roughnessTexture,
+               result.roughnessChannel,
+               "roughness");
+    validateUv(result.occlusionTexture,
+               result.occlusionChannel,
+               "occlusion");
+    validateUv(result.emissiveTexture,
+               result.emissiveChannel,
+               "emissive");
 
     result.unlit = TfStringToLower(shaderId.GetString()).find("unlit") != std::string::npos;
     return result;
@@ -646,10 +732,11 @@ boundMaterialId(SceneData& scene, const UsdPrim& prim)
 
 template<typename T>
 PrimvarData<T>
-readPrimvar(const UsdGeomPrimvar& primvar)
+readPrimvar(const UsdGeomPrimvar& primvar,
+            const UsdTimeCode time = UsdTimeCode::Default())
 {
     PrimvarData<T> result;
-    if (!primvar || !primvar.ComputeFlattened(&result.values, UsdTimeCode::Default())) {
+    if (!primvar || !primvar.ComputeFlattened(&result.values, time)) {
         return {};
     }
     result.interpolation = primvar.GetInterpolation();
@@ -661,51 +748,58 @@ readPrimvar(const UsdGeomPrimvar& primvar)
 
 template<typename T>
 PrimvarData<T>
-readAuthoredPrimvar(const UsdGeomPrimvar& primvar)
+readAuthoredPrimvar(const UsdGeomPrimvar& primvar,
+                    const UsdTimeCode time = UsdTimeCode::Default())
 {
-    return primvar && primvar.HasAuthoredValue() ? readPrimvar<T>(primvar)
+    return primvar && primvar.HasAuthoredValue() ? readPrimvar<T>(primvar, time)
                                                  : PrimvarData<T>{};
 }
 
 PrimvarData<GfVec3f>
-readNormals(const UsdGeomMesh& mesh)
+readNormals(const UsdGeomMesh& mesh,
+            const UsdTimeCode time = UsdTimeCode::Default())
 {
     const UsdGeomPrimvar authored =
       UsdGeomPrimvarsAPI(mesh.GetPrim()).GetPrimvar(TfToken("normals"));
-    PrimvarData<GfVec3f> result = readPrimvar<GfVec3f>(authored);
+    PrimvarData<GfVec3f> result = readPrimvar<GfVec3f>(authored, time);
     if (result) {
         return result;
     }
-    mesh.GetNormalsAttr().Get(&result.values, UsdTimeCode::Default());
+    mesh.GetNormalsAttr().Get(&result.values, time);
     result.interpolation = mesh.GetNormalsInterpolation();
     return result;
 }
 
 PrimvarData<GfVec2f>
-readUvs(const UsdGeomMesh& mesh, const TfToken& requestedName)
+readUvs(const UsdGeomMesh& mesh,
+        const TfToken& requestedName,
+        const UsdTimeCode time = UsdTimeCode::Default())
 {
     const UsdGeomPrimvarsAPI primvars(mesh.GetPrim());
     if (!requestedName.IsEmpty()) {
         PrimvarData<GfVec2f> requested =
-          readPrimvar<GfVec2f>(primvars.FindPrimvarWithInheritance(requestedName));
+          readPrimvar<GfVec2f>(
+            primvars.FindPrimvarWithInheritance(requestedName), time);
         if (requested) {
             return requested;
         }
         TF_WARN("Mesh <%s> does not provide requested UV primvar '%s'.",
                 mesh.GetPath().GetText(),
                 requestedName.GetText());
+        return {};
     }
     static const std::array<TfToken, 3> preferred = {
         TfToken("st"), TfToken("uv"), TfToken("UVMap")
     };
     for (const TfToken& name : preferred) {
-        PrimvarData<GfVec2f> result = readPrimvar<GfVec2f>(primvars.GetPrimvar(name));
+        PrimvarData<GfVec2f> result =
+          readPrimvar<GfVec2f>(primvars.GetPrimvar(name), time);
         if (result) {
             return result;
         }
     }
     for (const UsdGeomPrimvar& primvar : primvars.GetPrimvarsWithValues()) {
-        PrimvarData<GfVec2f> result = readPrimvar<GfVec2f>(primvar);
+        PrimvarData<GfVec2f> result = readPrimvar<GfVec2f>(primvar, time);
         if (result) {
             return result;
         }
@@ -725,11 +819,13 @@ materialUvName(const SceneData& scene,
         }
         visited[materialId] = true;
         const MaterialData& material = scene.materials[materialId];
-        const std::array<const TextureData*, 5> textures = {
+        const std::array<const TextureData*, 7> textures = {
             &material.baseTexture,
             &material.opacityTexture,
             &material.normalTexture,
-            &material.ormTexture,
+            &material.metallicTexture,
+            &material.roughnessTexture,
+            &material.occlusionTexture,
             &material.emissiveTexture,
         };
         for (const TextureData* texture : textures) {
@@ -893,6 +989,9 @@ hashVertex(const MeshData& mesh, size_t index)
     if (mesh.weights.size() == mesh.positions.size()) {
         hashValue(hash, mesh.weights[index]);
     }
+    if (mesh.sourcePointIndices.size() == mesh.positions.size()) {
+        hashValue(hash, mesh.sourcePointIndices[index]);
+    }
     return hash;
 }
 
@@ -910,12 +1009,16 @@ bool
 verticesEqual(const MeshData& mesh, size_t left, size_t right)
 {
     const size_t count = mesh.positions.size();
-    return mesh.positions[left] == mesh.positions[right] &&
-           vertexValueEqual(mesh.normals, count, left, right) &&
-           vertexValueEqual(mesh.uvs, count, left, right) &&
-           vertexValueEqual(mesh.colors, count, left, right) &&
-           vertexValueEqual(mesh.joints, count, left, right) &&
-           vertexValueEqual(mesh.weights, count, left, right);
+    if (mesh.positions[left] != mesh.positions[right] ||
+        !vertexValueEqual(mesh.normals, count, left, right) ||
+        !vertexValueEqual(mesh.uvs, count, left, right) ||
+        !vertexValueEqual(mesh.colors, count, left, right) ||
+        !vertexValueEqual(mesh.joints, count, left, right) ||
+        !vertexValueEqual(mesh.weights, count, left, right) ||
+        !vertexValueEqual(mesh.sourcePointIndices, count, left, right)) {
+        return false;
+    }
+    return true;
 }
 
 template<typename T>
@@ -952,7 +1055,18 @@ optimizeMesh(MeshData& mesh)
     welded.colors.reserve(mesh.colors.size());
     welded.joints.reserve(mesh.joints.size());
     welded.weights.reserve(mesh.weights.size());
+    welded.sourcePointIndices.reserve(mesh.sourcePointIndices.size());
     welded.indices.reserve(mesh.indices.size());
+    welded.morphTargets.reserve(mesh.morphTargets.size());
+    for (MorphTargetData& source : mesh.morphTargets) {
+        MorphTargetData target;
+        target.name = source.name;
+        target.influence = source.influence;
+        target.animation = source.animation;
+        target.pointOffsets = std::move(source.pointOffsets);
+        target.normalOffsets = std::move(source.normalOffsets);
+        welded.morphTargets.push_back(std::move(target));
+    }
 
     struct Candidate
     {
@@ -1006,9 +1120,39 @@ optimizeMesh(MeshData& mesh)
           welded.joints, mesh.joints, sourceVertexCount, sourceIndex);
         appendVertexValue(
           welded.weights, mesh.weights, sourceVertexCount, sourceIndex);
+        appendVertexValue(welded.sourcePointIndices,
+                          mesh.sourcePointIndices,
+                          sourceVertexCount,
+                          sourceIndex);
         welded.indices.push_back(weldedIndex);
     }
 
+    for (MorphTargetData& target : welded.morphTargets) {
+        target.positions.reserve(welded.positions.size());
+        if (!target.normalOffsets.empty()) {
+            target.normals.reserve(welded.normals.size());
+        }
+        for (size_t vertexIndex = 0;
+             vertexIndex < welded.positions.size();
+             ++vertexIndex) {
+            const uint32_t pointIndex =
+              welded.sourcePointIndices[vertexIndex];
+            target.positions.push_back(
+              welded.positions[vertexIndex] + target.pointOffsets[pointIndex]);
+            if (!target.normalOffsets.empty()) {
+                GfVec3f normal =
+                  welded.normals[vertexIndex] + target.normalOffsets[pointIndex];
+                normal.Normalize();
+                target.normals.push_back(normal);
+            }
+        }
+        target.pointOffsets.clear();
+        target.pointOffsets.shrink_to_fit();
+        target.normalOffsets.clear();
+        target.normalOffsets.shrink_to_fit();
+    }
+    welded.sourcePointIndices.clear();
+    welded.sourcePointIndices.shrink_to_fit();
     mesh = std::move(welded);
     return true;
 }
@@ -1109,6 +1253,39 @@ buildJointMap(const UsdSkelSkinningQuery& skinningQuery, const VtTokenArray& ske
     return result;
 }
 
+SdfPath
+mappedSkeletonPath(const UsdSkelSkinningQuery& skinningQuery,
+                   const SdfPath& skeletonPath)
+{
+    const UsdPrim skinningPrim = skinningQuery.GetPrim();
+    if (!skinningPrim.IsInstanceProxy()) {
+        return skeletonPath;
+    }
+    const UsdPrim prototypePrim = skinningPrim.GetPrimInPrototype();
+    if (!prototypePrim) {
+        return skeletonPath;
+    }
+    SdfPath prototypeRoot;
+    for (const SdfPath& prefix : prototypePrim.GetPath().GetPrefixes()) {
+        if (UsdPrim::IsPrototypePath(prefix)) {
+            prototypeRoot = prefix;
+            break;
+        }
+    }
+    if (prototypeRoot.IsEmpty() || !skeletonPath.HasPrefix(prototypeRoot)) {
+        return skeletonPath;
+    }
+
+    SdfPath instanceRoot = skinningPrim.GetPath();
+    size_t relativeElementCount =
+      prototypePrim.GetPath().GetPathElementCount() -
+      prototypeRoot.GetPathElementCount();
+    while (relativeElementCount-- > 0) {
+        instanceRoot = instanceRoot.GetParentPath();
+    }
+    return skeletonPath.ReplacePrefix(prototypeRoot, instanceRoot);
+}
+
 uint32_t
 registerSkeleton(SceneData& scene, const UsdSkelSkeletonQuery& query)
 {
@@ -1135,6 +1312,17 @@ registerSkeleton(SceneData& scene, const UsdSkelSkeletonQuery& query)
       &skeleton.restTransforms, UsdTimeCode::Default(), true);
     if (skeleton.restTransforms.size() != skeleton.joints.size()) {
         skeleton.restTransforms.assign(skeleton.joints.size(), GfMatrix4d(1.0));
+    }
+    VtMatrix4dArray skeletonBindTransforms;
+    if (!query.GetSkeleton().GetBindTransformsAttr().Get(&skeletonBindTransforms) ||
+        skeletonBindTransforms.size() != skeleton.joints.size()) {
+        skeleton.bindTransforms = skeleton.restTransforms;
+    } else {
+        skeleton.bindTransforms.resize(skeleton.joints.size());
+        if (!UsdSkelComputeJointLocalTransforms(
+              topology, skeletonBindTransforms, skeleton.bindTransforms)) {
+            skeleton.bindTransforms = skeleton.restTransforms;
+        }
     }
 
     if (animQuery) {
@@ -1187,6 +1375,9 @@ collectSkeletonBindings(const UsdStageRefPtr& stage, SceneData& scene)
                  binding.GetSkinningTargets()) {
                 SkinBinding skin;
                 skin.skeletonId = skeletonId;
+                skin.skeletonPath =
+                  mappedSkeletonPath(skinningQuery,
+                                     skeletonQuery.GetPrim().GetPath());
                 skin.query = skinningQuery;
                 skin.jointMap = buildJointMap(skinningQuery, skeleton.joints);
                 scene.skinBindings[skinningQuery.GetPrim().GetPath().GetString()] =
@@ -1202,7 +1393,8 @@ readSkinning(const SkinBinding* skin,
              GfMatrix4d& geomBind,
              uint32_t& influenceCount,
              std::vector<JointSet>& joints,
-             std::vector<WeightSet>& weights)
+             std::vector<WeightSet>& weights,
+             const UsdTimeCode time = UsdTimeCode::Default())
 {
     if (!skin) {
         return false;
@@ -1210,7 +1402,7 @@ readSkinning(const SkinBinding* skin,
     VtIntArray sourceJoints;
     VtFloatArray sourceWeights;
     if (!skin->query.ComputeVaryingJointInfluences(
-          pointCount, &sourceJoints, &sourceWeights, UsdTimeCode::Default())) {
+          pointCount, &sourceJoints, &sourceWeights, time)) {
         return false;
     }
     const int sourceInfluences = skin->query.GetNumInfluencesPerComponent();
@@ -1256,8 +1448,205 @@ readSkinning(const SkinBinding* skin,
             weights[point][0] = 1.0f;
         }
     }
-    geomBind = skin->query.GetGeomBindTransform(UsdTimeCode::Default());
+    geomBind = skin->query.GetGeomBindTransform(time);
     return true;
+}
+
+bool
+computeMorphWeights(const UsdSkelAnimQuery& animation,
+                    const UsdSkelAnimMapper& mapper,
+                    const UsdSkelBlendShapeQuery& blendShapes,
+                    const UsdTimeCode time,
+                    VtFloatArray& flattened)
+{
+    VtFloatArray animationWeights;
+    if (!animation.ComputeBlendShapeWeights(&animationWeights, time)) {
+        return false;
+    }
+    VtFloatArray localWeights;
+    const float zero = 0.0f;
+    if (!mapper.Remap(animationWeights, &localWeights, 1, &zero)) {
+        return false;
+    }
+    return blendShapes.ComputeFlattenedSubShapeWeights(localWeights, &flattened);
+}
+
+bool
+expandMorphOffsets(const VtVec3fArray& authored,
+                   const VtIntArray& pointIndices,
+                   size_t pointCount,
+                   const UsdPrim& blendShape,
+                   const char* label,
+                   std::vector<GfVec3f>& expanded)
+{
+    expanded.assign(pointCount, GfVec3f(0.0f));
+    if (authored.empty()) {
+        return true;
+    }
+    if (pointIndices.empty()) {
+        if (authored.size() != pointCount) {
+            TF_WARN("Blend shape <%s> has %zu %s offsets for %zu mesh points.",
+                    blendShape.GetPath().GetText(),
+                    authored.size(),
+                    label,
+                    pointCount);
+            return false;
+        }
+        std::copy(authored.begin(), authored.end(), expanded.begin());
+        return true;
+    }
+    if (authored.size() != pointIndices.size()) {
+        TF_WARN("Blend shape <%s> has mismatched %s offsets and point indices.",
+                blendShape.GetPath().GetText(),
+                label);
+        return false;
+    }
+    for (size_t index = 0; index < pointIndices.size(); ++index) {
+        const int pointIndex = pointIndices[index];
+        if (pointIndex < 0 || static_cast<size_t>(pointIndex) >= pointCount) {
+            TF_WARN("Blend shape <%s> has an invalid point index %d.",
+                    blendShape.GetPath().GetText(),
+                    pointIndex);
+            return false;
+        }
+        expanded[pointIndex] = authored[index];
+    }
+    return true;
+}
+
+std::vector<SourceMorphTarget>
+readMorphTargets(SceneData& scene,
+                 const UsdGeomMesh& mesh,
+                 size_t pointCount)
+{
+    const UsdSkelBindingAPI binding(mesh.GetPrim());
+    const UsdSkelBlendShapeQuery query(binding);
+    if (!query || query.GetNumSubShapes() == 0) {
+        return {};
+    }
+
+    const std::vector<VtIntArray> pointIndices =
+      query.ComputeBlendShapePointIndices();
+    const std::vector<VtVec3fArray> pointOffsets =
+      query.ComputeSubShapePointOffsets();
+    const std::vector<VtVec3fArray> normalOffsets =
+      query.ComputeSubShapeNormalOffsets();
+    if (pointOffsets.size() != query.GetNumSubShapes() ||
+        normalOffsets.size() != query.GetNumSubShapes() ||
+        pointIndices.size() != query.GetNumBlendShapes()) {
+        TF_WARN("Could not resolve blend shapes for mesh <%s>.",
+                mesh.GetPath().GetText());
+        return {};
+    }
+
+    VtFloatArray initialWeights(query.GetNumSubShapes(), 0.0f);
+    std::vector<float> animationTimes;
+    std::vector<VtFloatArray> animationWeights;
+    VtTokenArray localOrder;
+    const UsdPrim animationPrim = binding.GetInheritedAnimationSource();
+    const UsdSkelAnimation animationSchema(animationPrim);
+    const UsdSkelAnimQuery animation =
+      animationSchema ? scene.skelCache.GetAnimQuery(animationSchema)
+                      : UsdSkelAnimQuery();
+    if (animation &&
+        binding.GetBlendShapesAttr().Get(&localOrder) &&
+        localOrder.size() == query.GetNumBlendShapes()) {
+        const UsdSkelAnimMapper mapper(
+          animation.GetBlendShapeOrder(), localOrder);
+        VtFloatArray resolvedInitial;
+        if (computeMorphWeights(animation,
+                                mapper,
+                                query,
+                                UsdTimeCode::Default(),
+                                resolvedInitial) &&
+            resolvedInitial.size() == query.GetNumSubShapes()) {
+            initialWeights = std::move(resolvedInitial);
+        }
+
+        std::vector<double> times;
+        animation.GetBlendShapeWeightTimeSamples(&times);
+        addFrameIntervalSamples(times);
+        for (const double sampleTime : times) {
+            VtFloatArray resolved;
+            if (computeMorphWeights(animation,
+                                    mapper,
+                                    query,
+                                    UsdTimeCode(sampleTime),
+                                    resolved) &&
+                resolved.size() == query.GetNumSubShapes()) {
+                animationTimes.push_back(static_cast<float>(sampleTime));
+                animationWeights.push_back(std::move(resolved));
+            }
+        }
+    }
+
+    std::vector<SourceMorphTarget> result;
+    result.reserve(query.GetNumSubShapes());
+    for (size_t subShapeIndex = 0;
+         subShapeIndex < query.GetNumSubShapes();
+         ++subShapeIndex) {
+        if (pointOffsets[subShapeIndex].empty()) {
+            continue;
+        }
+        const size_t blendShapeIndex =
+          query.GetBlendShapeIndex(subShapeIndex);
+        if (blendShapeIndex >= pointIndices.size()) {
+            continue;
+        }
+        const UsdSkelBlendShape blendShape =
+          query.GetBlendShape(blendShapeIndex);
+        if (!blendShape) {
+            continue;
+        }
+
+        SourceMorphTarget target;
+        target.subShapeIndex = subShapeIndex;
+        target.target.name = displayName(blendShape.GetPrim(), "Blend shape");
+        const UsdSkelInbetweenShape inbetween =
+          query.GetInbetween(subShapeIndex);
+        if (inbetween) {
+            target.target.name += " " + inbetween.GetAttr().GetName().GetString();
+        }
+        target.target.influence = initialWeights[subShapeIndex];
+        if (!expandMorphOffsets(pointOffsets[subShapeIndex],
+                                pointIndices[blendShapeIndex],
+                                pointCount,
+                                blendShape.GetPrim(),
+                                "position",
+                                target.pointOffsets)) {
+            continue;
+        }
+        if (!normalOffsets[subShapeIndex].empty() &&
+            !expandMorphOffsets(normalOffsets[subShapeIndex],
+                                pointIndices[blendShapeIndex],
+                                pointCount,
+                                blendShape.GetPrim(),
+                                "normal",
+                                target.normalOffsets)) {
+            continue;
+        }
+        target.target.animation.times = animationTimes;
+        target.target.animation.influences.reserve(animationWeights.size());
+        for (const VtFloatArray& weights : animationWeights) {
+            target.target.animation.influences.push_back(
+              weights[subShapeIndex]);
+        }
+        result.push_back(std::move(target));
+    }
+    const bool hasNormalOffsets =
+      std::any_of(result.begin(),
+                  result.end(),
+                  [](const SourceMorphTarget& target) {
+                      return !target.normalOffsets.empty();
+                  });
+    if (hasNormalOffsets) {
+        for (SourceMorphTarget& target : result) {
+            if (target.normalOffsets.empty()) {
+                target.normalOffsets.assign(pointCount, GfVec3f(0.0f));
+            }
+        }
+    }
+    return result;
 }
 
 std::string
@@ -1285,14 +1674,17 @@ bool
 extractMesh(const UsdGeomMesh& usdMesh,
             uint32_t nodeId,
             SceneData& scene,
-            const SkinBinding* skin)
+            const SkinBinding* skin,
+            size_t* meshIndexOut = nullptr,
+            const std::string& cacheSuffix = {},
+            const UsdTimeCode time = UsdTimeCode::Default())
 {
     VtVec3fArray points;
     VtIntArray faceCounts;
     VtIntArray faceIndices;
-    if (!usdMesh.GetPointsAttr().Get(&points, UsdTimeCode::Default()) ||
-        !usdMesh.GetFaceVertexCountsAttr().Get(&faceCounts, UsdTimeCode::Default()) ||
-        !usdMesh.GetFaceVertexIndicesAttr().Get(&faceIndices, UsdTimeCode::Default()) ||
+    if (!usdMesh.GetPointsAttr().Get(&points, time) ||
+        !usdMesh.GetFaceVertexCountsAttr().Get(&faceCounts, time) ||
+        !usdMesh.GetFaceVertexIndicesAttr().Get(&faceIndices, time) ||
         points.empty() || faceCounts.empty()) {
         return false;
     }
@@ -1316,7 +1708,7 @@ extractMesh(const UsdGeomMesh& usdMesh,
     for (const UsdGeomSubset& subset :
          UsdShadeMaterialBindingAPI(usdMesh.GetPrim()).GetMaterialBindSubsets()) {
         VtIntArray subsetFaces;
-        if (!subset.GetIndicesAttr().Get(&subsetFaces, UsdTimeCode::Default())) {
+        if (!subset.GetIndicesAttr().Get(&subsetFaces, time)) {
             continue;
         }
         const uint32_t subsetMaterial = boundMaterialId(scene, subset.GetPrim());
@@ -1328,11 +1720,11 @@ extractMesh(const UsdGeomMesh& usdMesh,
     }
 
     bool doubleSided = false;
-    usdMesh.GetDoubleSidedAttr().Get(&doubleSided, UsdTimeCode::Default());
+    usdMesh.GetDoubleSidedAttr().Get(&doubleSided, time);
     TfToken orientation = UsdGeomTokens->rightHanded;
     UsdGeomGprim(usdMesh.GetPrim())
       .GetOrientationAttr()
-      .Get(&orientation, UsdTimeCode::Default());
+      .Get(&orientation, time);
     const bool declaredLeftHanded = orientation == UsdGeomTokens->leftHanded;
     const UsdPrim sourcePrim =
       usdMesh.GetPrim().IsInstanceProxy() ? usdMesh.GetPrim().GetPrimInPrototype()
@@ -1347,7 +1739,7 @@ extractMesh(const UsdGeomMesh& usdMesh,
     if (cachedWinding != scene.meshWinding.end()) {
         sourceLeftHanded = cachedWinding->second;
     } else {
-        normalData = readNormals(usdMesh);
+        normalData = readNormals(usdMesh, time);
         normalsRead = true;
         if (const std::optional<bool> inferred =
               inferLeftHandedWinding(points, faceCounts, faceIndices, normalData)) {
@@ -1368,7 +1760,13 @@ extractMesh(const UsdGeomMesh& usdMesh,
     bool skinningValid = false;
     if (skin) {
         skinningValid = readSkinning(
-          skin, points.size(), geomBind, influenceCount, pointJoints, pointWeights);
+          skin,
+          points.size(),
+          geomBind,
+          influenceCount,
+          pointJoints,
+          pointWeights,
+          time);
         if (!skinningValid) {
             TF_WARN(
               "Could not read skinning influences for mesh <%s>; emitting it as a static mesh.",
@@ -1383,14 +1781,49 @@ extractMesh(const UsdGeomMesh& usdMesh,
     const bool outputLeftHanded = sourceLeftHanded != bakedReflection;
     const uint32_t skeletonId =
       skinningValid ? skin->skeletonId : kMissingOffset;
-    const std::string key = meshCacheKey(usdMesh.GetPrim(),
-                                         faceMaterials,
-                                         skeletonId,
-                                         doubleSided,
-                                         outputLeftHanded);
+    uint32_t placementNodeId = nodeId;
+    if (skinningValid) {
+        const auto skeletonNode =
+          scene.nodeIds.find(skin->skeletonPath.GetString());
+        if (skeletonNode == scene.nodeIds.end()) {
+            TF_WARN("Could not find the Skeleton transform <%s> for skinned mesh <%s>.",
+                    skin->skeletonPath.GetText(),
+                    usdMesh.GetPath().GetText());
+            return false;
+        }
+        placementNodeId = skeletonNode->second;
+    }
+    std::string key =
+      meshCacheKey(usdMesh.GetPrim(),
+                   faceMaterials,
+                   skeletonId,
+                   doubleSided,
+                   outputLeftHanded) +
+      cacheSuffix;
+    if (skinningValid) {
+        uint64_t geomBindHash = 1469598103934665603ull;
+        for (size_t row = 0; row < 4; ++row) {
+            for (size_t column = 0; column < 4; ++column) {
+                hashValue(geomBindHash, geomBind[row][column]);
+            }
+        }
+        key += "|g" + std::to_string(geomBindHash);
+    }
+    const UsdSkelBindingAPI blendShapeBinding(usdMesh.GetPrim());
+    if (blendShapeBinding.GetBlendShapesAttr().HasAuthoredValue()) {
+        const UsdPrim animationSource =
+          blendShapeBinding.GetInheritedAnimationSource();
+        key += "|morphAnimation:";
+        key += animationSource
+                 ? animationSource.GetPath().GetString()
+                 : std::string("none");
+    }
     const auto cached = scene.meshIds.find(key);
     if (cached != scene.meshIds.end()) {
-        scene.meshes[cached->second].nodeIds.push_back(nodeId);
+        scene.meshes[cached->second].nodeIds.push_back(placementNodeId);
+        if (meshIndexOut) {
+            *meshIndexOut = cached->second;
+        }
         return true;
     }
 
@@ -1402,7 +1835,7 @@ extractMesh(const UsdGeomMesh& usdMesh,
     mesh.influenceCount = influenceCount;
 
     if (!normalsRead) {
-        normalData = readNormals(usdMesh);
+        normalData = readNormals(usdMesh, time);
     }
     std::vector<GfVec3f> generatedNormals;
     if (!normalData) {
@@ -1411,18 +1844,35 @@ extractMesh(const UsdGeomMesh& usdMesh,
         normalData.values.assign(generatedNormals.begin(), generatedNormals.end());
         normalData.interpolation = UsdGeomTokens->vertex;
     }
+    const GfMatrix4d normalTransform = geomBind.GetInverse().GetTranspose();
+    std::vector<SourceMorphTarget> morphTargets =
+      readMorphTargets(scene, usdMesh, points.size());
+    for (SourceMorphTarget& target : morphTargets) {
+        for (GfVec3f& offset : target.pointOffsets) {
+            offset = GfVec3f(
+              geomBind.TransformDir(GfVec3d(offset)));
+        }
+        for (GfVec3f& offset : target.normalOffsets) {
+            offset = GfVec3f(
+              normalTransform.TransformDir(GfVec3d(offset)));
+        }
+    }
     TfToken uvName;
     if (!materialUvName(scene, faceMaterials, uvName)) {
         return false;
     }
-    const PrimvarData<GfVec2f> uvData = readUvs(usdMesh, uvName);
+    const PrimvarData<GfVec2f> uvData = readUvs(usdMesh, uvName, time);
+    if (!uvName.IsEmpty() && !uvData) {
+        TF_WARN("Cannot emit mesh <%s>: its material textures require UV primvar '%s'.",
+                usdMesh.GetPath().GetText(),
+                uvName.GetText());
+        return false;
+    }
     const UsdGeomGprim gprim(usdMesh.GetPrim());
     const PrimvarData<GfVec3f> colorData =
-      readAuthoredPrimvar<GfVec3f>(gprim.GetDisplayColorPrimvar());
+      readAuthoredPrimvar<GfVec3f>(gprim.GetDisplayColorPrimvar(), time);
     const PrimvarData<float> opacityData =
-      readAuthoredPrimvar<float>(gprim.GetDisplayOpacityPrimvar());
-
-    const GfMatrix4d normalTransform = geomBind.GetInverse().GetTranspose();
+      readAuthoredPrimvar<float>(gprim.GetDisplayOpacityPrimvar(), time);
 
     std::map<uint32_t, std::vector<uint32_t>> materialIndices;
     auto appendVertex = [&](size_t faceIndex, size_t cornerIndex, int pointIndex) {
@@ -1452,6 +1902,10 @@ extractMesh(const UsdGeomMesh& usdMesh,
         if (!pointJoints.empty()) {
             mesh.joints.push_back(pointJoints[point]);
             mesh.weights.push_back(pointWeights[point]);
+        }
+        if (!morphTargets.empty()) {
+            mesh.sourcePointIndices.push_back(
+              static_cast<uint32_t>(point));
         }
         return static_cast<uint32_t>(mesh.positions.size() - 1);
     };
@@ -1487,19 +1941,258 @@ extractMesh(const UsdGeomMesh& usdMesh,
         mesh.indices.insert(mesh.indices.end(), indices.begin(), indices.end());
         mesh.submeshes.push_back(submesh);
     }
-    mesh.nodeIds.push_back(nodeId);
+    mesh.morphTargets.reserve(morphTargets.size());
+    for (SourceMorphTarget& target : morphTargets) {
+        target.target.pointOffsets = std::move(target.pointOffsets);
+        target.target.normalOffsets = std::move(target.normalOffsets);
+        mesh.morphTargets.push_back(std::move(target.target));
+    }
+    mesh.nodeIds.push_back(placementNodeId);
     const size_t meshIndex = scene.meshes.size();
     scene.meshIds.emplace(key, meshIndex);
     scene.meshes.push_back(std::move(mesh));
+    if (meshIndexOut) {
+        *meshIndexOut = meshIndex;
+    }
     return true;
 }
 
 bool
-isVisible(const UsdPrim& prim)
+isVisible(const UsdPrim& prim,
+          const UsdTimeCode time = UsdTimeCode::Default())
 {
     const UsdGeomImageable imageable(prim);
     return !imageable ||
-           imageable.ComputeVisibility(UsdTimeCode::Default()) != UsdGeomTokens->invisible;
+           imageable.ComputeVisibility(time) != UsdGeomTokens->invisible;
+}
+
+bool
+extractAnalyticPrimitive(const UsdPrim& prim,
+                         uint32_t nodeId,
+                         SceneData& scene,
+                         size_t* primitiveIndexOut,
+                         const std::string& cacheSuffix,
+                         UsdTimeCode time);
+
+bool
+extractPointInstancer(const UsdGeomPointInstancer& instancer,
+                      uint32_t nodeId,
+                      SceneData& scene)
+{
+    SdfPathVector prototypePaths;
+    if (!instancer.GetPrototypesRel().GetForwardedTargets(&prototypePaths) ||
+        prototypePaths.empty()) {
+        TF_WARN("Skipping point instancer <%s> without prototypes.",
+                instancer.GetPath().GetText());
+        return true;
+    }
+
+    std::vector<double> instanceTimes;
+    const std::array<UsdAttribute, 11> instanceAttributes = {
+        instancer.GetProtoIndicesAttr(),
+        instancer.GetPositionsAttr(),
+        instancer.GetOrientationsAttr(),
+        instancer.GetOrientationsfAttr(),
+        instancer.GetScalesAttr(),
+        instancer.GetVelocitiesAttr(),
+        instancer.GetAccelerationsAttr(),
+        instancer.GetAngularVelocitiesAttr(),
+        instancer.GetIdsAttr(),
+        instancer.GetInvisibleIdsAttr(),
+        instancer.GetVisibilityAttr(),
+    };
+    for (const UsdAttribute& attribute : instanceAttributes) {
+        std::vector<double> attributeTimes;
+        attribute.GetTimeSamples(&attributeTimes);
+        instanceTimes.insert(
+          instanceTimes.end(), attributeTimes.begin(), attributeTimes.end());
+    }
+    for (const SdfPath& prototypePath : prototypePaths) {
+        const UsdPrim prototype =
+          instancer.GetPrim().GetStage()->GetPrimAtPath(prototypePath);
+        for (const UsdPrim& prim :
+             UsdPrimRange(prototype, UsdTraverseInstanceProxies())) {
+            for (const UsdAttribute& attribute : prim.GetAttributes()) {
+                std::vector<double> attributeTimes;
+                attribute.GetTimeSamples(&attributeTimes);
+                instanceTimes.insert(instanceTimes.end(),
+                                     attributeTimes.begin(),
+                                     attributeTimes.end());
+            }
+        }
+    }
+    std::sort(instanceTimes.begin(), instanceTimes.end());
+    instanceTimes.erase(std::unique(instanceTimes.begin(), instanceTimes.end()),
+                        instanceTimes.end());
+    const bool unsupportedAnimation = instanceTimes.size() > 1;
+    std::vector<double> instancerTransformTimes;
+    UsdGeomXformable(instancer).GetTimeSamples(&instancerTransformTimes);
+    instanceTimes.insert(instanceTimes.end(),
+                         instancerTransformTimes.begin(),
+                         instancerTransformTimes.end());
+    std::sort(instanceTimes.begin(), instanceTimes.end());
+    instanceTimes.erase(std::unique(instanceTimes.begin(), instanceTimes.end()),
+                        instanceTimes.end());
+    const UsdTimeCode time =
+      instanceTimes.empty()
+        ? UsdTimeCode::Default()
+        : UsdTimeCode(instanceTimes.front());
+    if (unsupportedAnimation) {
+        TF_WARN("Point instancer <%s> has animated instance or prototype data; "
+                "importing its first frame as static thin instances.",
+                instancer.GetPath().GetText());
+    }
+    if (!isVisible(instancer.GetPrim(), time)) {
+        return true;
+    }
+    if (!time.IsDefault()) {
+        NodeData& instancerNode = scene.nodes[nodeId - 1];
+        bool resetsXformStack = false;
+        UsdGeomXformable(instancer).GetLocalTransformation(
+          &instancerNode.localTransform, &resetsXformStack, time);
+        if (resetsXformStack) {
+            instancerNode.parentId = kMissingOffset;
+        }
+    }
+
+    VtIntArray prototypeIndices;
+    if (!instancer.GetProtoIndicesAttr().Get(&prototypeIndices, time)) {
+        TF_WARN("Skipping point instancer <%s> without prototype indices.",
+                instancer.GetPath().GetText());
+        return true;
+    }
+
+    UsdGeomXformCache xformCache(time);
+    VtMatrix4dArray instanceTransforms;
+    if (!instancer.ComputeInstanceTransformsAtTime(
+          &instanceTransforms,
+          time,
+          time,
+          UsdGeomPointInstancer::IncludeProtoXform,
+          UsdGeomPointInstancer::IgnoreMask) ||
+        instanceTransforms.size() != prototypeIndices.size()) {
+        TF_WARN("Could not compute transforms for point instancer <%s>.",
+                instancer.GetPath().GetText());
+        return false;
+    }
+
+    const std::vector<bool> mask = instancer.ComputeMaskAtTime(time);
+    if (!mask.empty() && mask.size() != prototypeIndices.size()) {
+        TF_WARN("Point instancer <%s> produced an invalid visibility mask.",
+                instancer.GetPath().GetText());
+        return false;
+    }
+
+    std::vector<std::vector<size_t>> instancesByPrototype(prototypePaths.size());
+    for (size_t instanceIndex = 0; instanceIndex < prototypeIndices.size();
+         ++instanceIndex) {
+        const int prototypeIndex = prototypeIndices[instanceIndex];
+        if (prototypeIndex < 0 ||
+            static_cast<size_t>(prototypeIndex) >= prototypePaths.size()) {
+            TF_WARN("Point instancer <%s> references invalid prototype index %d.",
+                    instancer.GetPath().GetText(),
+                    prototypeIndex);
+            return false;
+        }
+        if (mask.empty() || mask[instanceIndex]) {
+            instancesByPrototype[prototypeIndex].push_back(instanceIndex);
+        }
+    }
+    const UsdStagePtr stage = instancer.GetPrim().GetStage();
+    for (size_t prototypeIndex = 0; prototypeIndex < prototypePaths.size();
+         ++prototypeIndex) {
+        const std::vector<size_t>& instanceIndices =
+          instancesByPrototype[prototypeIndex];
+        if (instanceIndices.empty()) {
+            continue;
+        }
+        const UsdPrim prototype = stage->GetPrimAtPath(prototypePaths[prototypeIndex]);
+        if (!prototype) {
+            TF_WARN("Point instancer <%s> references missing prototype <%s>.",
+                    instancer.GetPath().GetText(),
+                    prototypePaths[prototypeIndex].GetText());
+            return false;
+        }
+
+        UsdPrimRange range(prototype, UsdTraverseInstanceProxies());
+        for (auto iterator = range.begin(); iterator != range.end(); ++iterator) {
+            const UsdPrim prim = *iterator;
+            if (!isVisible(prim, time)) {
+                iterator.PruneChildren();
+                continue;
+            }
+            if (prim.IsA<UsdGeomPointInstancer>()) {
+                TF_WARN("Nested point instancer <%s> is not yet supported.",
+                        prim.GetPath().GetText());
+                iterator.PruneChildren();
+                continue;
+            }
+            const bool isMesh = prim.IsA<UsdGeomMesh>();
+            const bool isAnalytic =
+              prim.IsA<UsdGeomCube>() || prim.IsA<UsdGeomSphere>() ||
+              prim.IsA<UsdGeomCylinder>() || prim.IsA<UsdGeomCone>();
+            if (!isMesh && !isAnalytic) {
+                if (prim.IsA<UsdGeomGprim>()) {
+                    TF_WARN("Skipping unsupported point-instanced geometry <%s>.",
+                            prim.GetPath().GetText());
+                }
+                continue;
+            }
+
+            bool resetsXformStack = false;
+            const GfMatrix4d prototypeRelative =
+              xformCache.ComputeRelativeTransform(
+                prim, prototype, &resetsXformStack);
+            if (resetsXformStack) {
+                TF_WARN("Skipping point-instanced mesh <%s> with a reset transform stack.",
+                        prim.GetPath().GetText());
+                continue;
+            }
+
+            NodeData sourceNode;
+            sourceNode.path = prim.GetPath();
+            sourceNode.name = displayName(prim, "Prototype");
+            sourceNode.parentId = nodeId;
+            scene.nodes.push_back(std::move(sourceNode));
+            const uint32_t sourceNodeId =
+              static_cast<uint32_t>(scene.nodes.size());
+
+            const std::string cacheSuffix =
+              "|pointInstancer:" + instancer.GetPath().GetString() +
+              "|placement:" + prim.GetPath().GetString();
+            ThinInstanceData batch;
+            if (isMesh) {
+                if (!extractMesh(UsdGeomMesh(prim),
+                                 sourceNodeId,
+                                 scene,
+                                 nullptr,
+                                 &batch.sourceIndex,
+                                 cacheSuffix,
+                                 time)) {
+                    return false;
+                }
+            } else {
+                batch.analyticSource = true;
+                if (!extractAnalyticPrimitive(
+                      prim,
+                      sourceNodeId,
+                      scene,
+                      &batch.sourceIndex,
+                      cacheSuffix,
+                      time)) {
+                    return false;
+                }
+            }
+
+            batch.transforms.reserve(instanceIndices.size());
+            for (const size_t instanceIndex : instanceIndices) {
+                batch.transforms.emplace_back(
+                  prototypeRelative * instanceTransforms[instanceIndex]);
+            }
+            scene.thinInstances.push_back(std::move(batch));
+        }
+    }
+    return true;
 }
 
 PrimitiveAxis
@@ -1515,7 +2208,9 @@ primitiveAxis(const TfToken& axis)
 }
 
 uint32_t
-analyticMaterialId(SceneData& scene, const UsdPrim& prim)
+analyticMaterialId(SceneData& scene,
+                   const UsdPrim& prim,
+                   const UsdTimeCode time)
 {
     const uint32_t bound = boundMaterialId(scene, prim);
     if (bound != 0) {
@@ -1530,9 +2225,9 @@ analyticMaterialId(SceneData& scene, const UsdPrim& prim)
     }
     const UsdGeomGprim gprim(prim);
     const PrimvarData<GfVec3f> color =
-      readAuthoredPrimvar<GfVec3f>(gprim.GetDisplayColorPrimvar());
+      readAuthoredPrimvar<GfVec3f>(gprim.GetDisplayColorPrimvar(), time);
     const PrimvarData<float> opacity =
-      readAuthoredPrimvar<float>(gprim.GetDisplayOpacityPrimvar());
+      readAuthoredPrimvar<float>(gprim.GetDisplayOpacityPrimvar(), time);
     if (!color && !opacity) {
         scene.analyticMaterialIds.emplace(key, 0);
         return 0;
@@ -1577,22 +2272,27 @@ analyticMaterialId(SceneData& scene, const UsdPrim& prim)
 }
 
 bool
-extractAnalyticPrimitive(const UsdPrim& prim, uint32_t nodeId, SceneData& scene)
+extractAnalyticPrimitive(const UsdPrim& prim,
+                         uint32_t nodeId,
+                         SceneData& scene,
+                         size_t* primitiveIndexOut,
+                         const std::string& cacheSuffix,
+                         const UsdTimeCode time)
 {
     AnalyticPrimitiveData primitive;
     primitive.name = displayName(prim, "Primitive");
     primitive.nodeIds.push_back(nodeId);
-    primitive.materialId = analyticMaterialId(scene, prim);
+    primitive.materialId = analyticMaterialId(scene, prim, time);
 
     if (prim.IsA<UsdGeomCube>()) {
         double size = 2.0;
-        UsdGeomCube(prim).GetSizeAttr().Get(&size, UsdTimeCode::Default());
+        UsdGeomCube(prim).GetSizeAttr().Get(&size, time);
         primitive.type = AnalyticPrimitiveType::Cube;
         primitive.sizeOrRadius = static_cast<float>(size);
         primitive.tessellation = 0;
     } else if (prim.IsA<UsdGeomSphere>()) {
         double radius = 1.0;
-        UsdGeomSphere(prim).GetRadiusAttr().Get(&radius, UsdTimeCode::Default());
+        UsdGeomSphere(prim).GetRadiusAttr().Get(&radius, time);
         primitive.type = AnalyticPrimitiveType::Sphere;
         primitive.sizeOrRadius = static_cast<float>(radius);
     } else if (prim.IsA<UsdGeomCylinder>()) {
@@ -1600,9 +2300,9 @@ extractAnalyticPrimitive(const UsdPrim& prim, uint32_t nodeId, SceneData& scene)
         double height = 2.0;
         TfToken axis = UsdGeomTokens->z;
         const UsdGeomCylinder cylinder(prim);
-        cylinder.GetRadiusAttr().Get(&radius, UsdTimeCode::Default());
-        cylinder.GetHeightAttr().Get(&height, UsdTimeCode::Default());
-        cylinder.GetAxisAttr().Get(&axis, UsdTimeCode::Default());
+        cylinder.GetRadiusAttr().Get(&radius, time);
+        cylinder.GetHeightAttr().Get(&height, time);
+        cylinder.GetAxisAttr().Get(&axis, time);
         primitive.type = AnalyticPrimitiveType::Cylinder;
         primitive.axis = primitiveAxis(axis);
         primitive.sizeOrRadius = static_cast<float>(radius);
@@ -1612,9 +2312,9 @@ extractAnalyticPrimitive(const UsdPrim& prim, uint32_t nodeId, SceneData& scene)
         double height = 2.0;
         TfToken axis = UsdGeomTokens->z;
         const UsdGeomCone cone(prim);
-        cone.GetRadiusAttr().Get(&radius, UsdTimeCode::Default());
-        cone.GetHeightAttr().Get(&height, UsdTimeCode::Default());
-        cone.GetAxisAttr().Get(&axis, UsdTimeCode::Default());
+        cone.GetRadiusAttr().Get(&radius, time);
+        cone.GetHeightAttr().Get(&height, time);
+        cone.GetAxisAttr().Get(&axis, time);
         primitive.type = AnalyticPrimitiveType::Cone;
         primitive.axis = primitiveAxis(axis);
         primitive.sizeOrRadius = static_cast<float>(radius);
@@ -1634,8 +2334,8 @@ extractAnalyticPrimitive(const UsdPrim& prim, uint32_t nodeId, SceneData& scene)
     const UsdGeomGprim gprim(prim);
     bool doubleSided = false;
     TfToken orientation = UsdGeomTokens->rightHanded;
-    gprim.GetDoubleSidedAttr().Get(&doubleSided, UsdTimeCode::Default());
-    gprim.GetOrientationAttr().Get(&orientation, UsdTimeCode::Default());
+    gprim.GetDoubleSidedAttr().Get(&doubleSided, time);
+    gprim.GetOrientationAttr().Get(&orientation, time);
     primitive.flags = doubleSided ? MeshDoubleSided : 0;
     primitive.flags |= orientation == UsdGeomTokens->leftHanded ? MeshLeftHanded : 0;
     const UsdPrim source = prim.IsInstanceProxy() ? prim.GetPrimInPrototype() : prim;
@@ -1645,14 +2345,22 @@ extractAnalyticPrimitive(const UsdPrim& prim, uint32_t nodeId, SceneData& scene)
       sourcePath + "|" + std::to_string(static_cast<uint32_t>(primitive.type)) + "|" +
       std::to_string(primitive.materialId) + "|" + std::to_string(primitive.flags) + "|" +
       std::to_string(static_cast<uint32_t>(primitive.axis)) + "|" +
-      std::to_string(primitive.sizeOrRadius) + "|" + std::to_string(primitive.height);
+      std::to_string(primitive.sizeOrRadius) + "|" + std::to_string(primitive.height) +
+      cacheSuffix;
     const auto cachedPrimitive = scene.analyticPrimitiveIds.find(key);
     if (cachedPrimitive != scene.analyticPrimitiveIds.end()) {
         scene.analyticPrimitives[cachedPrimitive->second].nodeIds.push_back(nodeId);
+        if (primitiveIndexOut) {
+            *primitiveIndexOut = cachedPrimitive->second;
+        }
         return true;
     }
-    scene.analyticPrimitiveIds.emplace(key, scene.analyticPrimitives.size());
+    const size_t primitiveIndex = scene.analyticPrimitives.size();
+    scene.analyticPrimitiveIds.emplace(key, primitiveIndex);
     scene.analyticPrimitives.push_back(std::move(primitive));
+    if (primitiveIndexOut) {
+        *primitiveIndexOut = primitiveIndex;
+    }
     return true;
 }
 
@@ -1664,18 +2372,40 @@ extractStage(const UsdStageRefPtr& stage, SceneData& scene)
     scene.timeCodesPerSecond = stage->GetTimeCodesPerSecond();
     collectSkeletonBindings(stage, scene);
 
-    for (const UsdPrim& prim : stage->Traverse(UsdTraverseInstanceProxies())) {
-        if (!isVisible(prim)) {
-            continue;
-        }
+    UsdPrimRange range = stage->Traverse(UsdTraverseInstanceProxies());
+    for (auto iterator = range.begin(); iterator != range.end(); ++iterator) {
+        const UsdPrim prim = *iterator;
+        const bool isPointInstancer = prim.IsA<UsdGeomPointInstancer>();
         const UsdGeomXformable xformable(prim);
-        uint32_t nodeId = kMissingOffset;
         if (xformable) {
             scene.nodes.push_back(readNode(prim, scene));
-            nodeId = static_cast<uint32_t>(scene.nodes.size());
-            scene.nodeIds[prim.GetPath().GetString()] = nodeId;
+            scene.nodeIds[prim.GetPath().GetString()] =
+              static_cast<uint32_t>(scene.nodes.size());
         }
-        if (nodeId == kMissingOffset) {
+        if (isPointInstancer) {
+            iterator.PruneChildren();
+        }
+    }
+
+    range = stage->Traverse(UsdTraverseInstanceProxies());
+    for (auto iterator = range.begin(); iterator != range.end(); ++iterator) {
+        const UsdPrim prim = *iterator;
+        const bool isPointInstancer = prim.IsA<UsdGeomPointInstancer>();
+        if (!isPointInstancer && !isVisible(prim)) {
+            iterator.PruneChildren();
+            continue;
+        }
+        const auto node = scene.nodeIds.find(prim.GetPath().GetString());
+        if (node == scene.nodeIds.end()) {
+            continue;
+        }
+        const uint32_t nodeId = node->second;
+        if (isPointInstancer) {
+            if (!extractPointInstancer(
+                  UsdGeomPointInstancer(prim), nodeId, scene)) {
+                return false;
+            }
+            iterator.PruneChildren();
             continue;
         }
         if (prim.IsA<UsdGeomMesh>()) {
@@ -1687,7 +2417,8 @@ extractStage(const UsdStageRefPtr& stage, SceneData& scene)
                 return false;
             }
         } else {
-            extractAnalyticPrimitive(prim, nodeId, scene);
+            extractAnalyticPrimitive(
+              prim, nodeId, scene, nullptr, {}, UsdTimeCode::Default());
         }
     }
     return true;
@@ -1731,15 +2462,35 @@ wrapMode(const TfToken& mode)
     return mode == TfToken("repeat") ? 1 : 0;
 }
 
+TextureSourceColorSpace
+sourceColorSpace(const TfToken& value)
+{
+    if (value == TfToken("raw")) {
+        return TextureSourceColorSpace::Raw;
+    }
+    if (value == TfToken("sRGB")) {
+        return TextureSourceColorSpace::SRGB;
+    }
+    return TextureSourceColorSpace::Auto;
+}
+
 int32_t
 emitTexture(CommandWriter& commands,
             BufferWriter& data,
             const TextureData& texture,
-            uint32_t textureId,
+            uint32_t& nextTextureId,
+            std::unordered_map<std::string, uint32_t>& textureCache,
             std::unordered_map<std::string, std::pair<uint32_t, uint32_t>>& imageCache)
 {
     if (!texture) {
         return -1;
+    }
+    const std::string sourceKey = texture.sourceShader.GetString();
+    if (!sourceKey.empty()) {
+        const auto existing = textureCache.find(sourceKey);
+        if (existing != textureCache.end()) {
+            return static_cast<int32_t>(existing->second);
+        }
     }
     const std::string resolved = resolvedTexturePath(texture);
     if (resolved.empty()) {
@@ -1776,12 +2527,20 @@ emitTexture(CommandWriter& commands,
       appendString(data, texture.name.empty() ? TfGetBaseName(resolved) : texture.name, nameLength);
     data.align();
     const uint32_t transformOffset = data.size();
-    data.f32(texture.scale[0]);
-    data.f32(texture.scale[1]);
-    data.f32(texture.translation[0]);
-    data.f32(texture.translation[1]);
+    data.f32(texture.uvScale[0]);
+    data.f32(texture.uvScale[1]);
+    data.f32(texture.uvTranslation[0]);
+    data.f32(texture.uvTranslation[1]);
     data.f32(texture.rotation);
+    const uint32_t valueTransformOffset = data.size();
+    for (int index = 0; index < 4; ++index) {
+        data.f32(texture.valueScale[index]);
+    }
+    for (int index = 0; index < 4; ++index) {
+        data.f32(texture.valueBias[index]);
+    }
 
+    const uint32_t textureId = nextTextureId++;
     const uint32_t record = commands.begin(Command::Texture);
     commands.buffer.u32(textureId);
     commands.buffer.u32(nameOffset);
@@ -1793,7 +2552,12 @@ emitTexture(CommandWriter& commands,
     commands.buffer.u32(transformOffset);
     commands.buffer.u32(wrapMode(texture.wrapS));
     commands.buffer.u32(wrapMode(texture.wrapT));
+    commands.buffer.u32(static_cast<uint32_t>(sourceColorSpace(texture.sourceColorSpace)));
+    commands.buffer.u32(valueTransformOffset);
     commands.end(record);
+    if (!sourceKey.empty()) {
+        textureCache.emplace(sourceKey, textureId);
+    }
     return static_cast<int32_t>(textureId);
 }
 
@@ -1801,82 +2565,78 @@ void
 emitMaterials(CommandWriter& commands, BufferWriter& data, const SceneData& scene)
 {
     uint32_t nextTextureId = 1;
+    std::unordered_map<std::string, uint32_t> textureCache;
     std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> imageCache;
     for (size_t materialIndex = 0; materialIndex < scene.materials.size();
          ++materialIndex) {
         const MaterialData& material = scene.materials[materialIndex];
-        const int32_t baseTexture =
-          emitTexture(commands,
-                      data,
-                      material.baseTexture,
-                      nextTextureId,
-                      imageCache);
-        nextTextureId += baseTexture >= 0 ? 1 : 0;
-        const int32_t opacityTexture =
-          emitTexture(commands,
-                      data,
-                      material.opacityTexture,
-                      nextTextureId,
-                      imageCache);
-        nextTextureId += opacityTexture >= 0 ? 1 : 0;
-        const int32_t normalTexture =
-          emitTexture(commands,
-                      data,
-                      material.normalTexture,
-                      nextTextureId,
-                      imageCache);
-        nextTextureId += normalTexture >= 0 ? 1 : 0;
-        const int32_t ormTexture =
-          emitTexture(commands,
-                      data,
-                      material.ormTexture,
-                      nextTextureId,
-                      imageCache);
-        nextTextureId += ormTexture >= 0 ? 1 : 0;
-        const int32_t emissiveTexture =
-          emitTexture(commands,
-                      data,
-                      material.emissiveTexture,
-                      nextTextureId,
-                      imageCache);
-        nextTextureId += emissiveTexture >= 0 ? 1 : 0;
+        const std::array<const TextureData*, 7> textureData = {
+            &material.baseTexture,
+            &material.opacityTexture,
+            &material.normalTexture,
+            &material.metallicTexture,
+            &material.roughnessTexture,
+            &material.occlusionTexture,
+            &material.emissiveTexture,
+        };
+        std::array<int32_t, 7> textureIds;
+        for (size_t index = 0; index < textureData.size(); ++index) {
+            textureIds[index] = emitTexture(commands,
+                                            data,
+                                            *textureData[index],
+                                            nextTextureId,
+                                            textureCache,
+                                            imageCache);
+        }
+        const std::array<uint32_t, 7> authoredChannels = {
+            material.baseChannel,
+            material.opacityChannel,
+            material.normalChannel,
+            material.metallicChannel,
+            material.roughnessChannel,
+            material.occlusionChannel,
+            material.emissiveChannel,
+        };
 
         data.align();
+        const bool hasBaseTexture = textureIds[0] >= 0;
+        const bool hasOpacityTexture = textureIds[1] >= 0;
+        const bool hasMetallicTexture = textureIds[3] >= 0;
+        const bool hasRoughnessTexture = textureIds[4] >= 0;
+        const bool hasEmissiveTexture = textureIds[6] >= 0;
         const uint32_t baseOffset = data.size();
-        data.f32(material.baseColor[0]);
-        data.f32(material.baseColor[1]);
-        data.f32(material.baseColor[2]);
-        data.f32(material.opacity);
+        data.f32(hasBaseTexture ? 1.0f : material.baseColor[0]);
+        data.f32(hasBaseTexture ? 1.0f : material.baseColor[1]);
+        data.f32(hasBaseTexture ? 1.0f : material.baseColor[2]);
+        data.f32(hasOpacityTexture ? 1.0f : material.opacity);
         const uint32_t emissiveOffset = data.size();
-        data.f32(material.emissive[0]);
-        data.f32(material.emissive[1]);
-        data.f32(material.emissive[2]);
+        data.f32(hasEmissiveTexture ? 1.0f : material.emissive[0]);
+        data.f32(hasEmissiveTexture ? 1.0f : material.emissive[1]);
+        data.f32(hasEmissiveTexture ? 1.0f : material.emissive[2]);
         uint32_t nameLength = 0;
         const uint32_t nameOffset = appendString(data, material.name, nameLength);
 
         uint32_t flags = material.unlit ? MaterialUnlit : 0;
         flags |= material.doubleSided ? MaterialDoubleSided : 0;
-        flags |= material.opacity < 0.999f || opacityTexture >= 0 ? MaterialAlphaBlend : 0;
+        flags |= material.opacity < 0.999f || hasOpacityTexture ? MaterialAlphaBlend : 0;
         const uint32_t record = commands.begin(Command::Material);
         commands.buffer.u32(static_cast<uint32_t>(materialIndex));
         commands.buffer.u32(nameOffset);
         commands.buffer.u32(nameLength);
         commands.buffer.u32(baseOffset);
         commands.buffer.u32(emissiveOffset);
-        commands.buffer.f32(material.metallic);
-        commands.buffer.f32(material.roughness);
+        commands.buffer.f32(hasMetallicTexture ? 1.0f : material.metallic);
+        commands.buffer.f32(hasRoughnessTexture ? 1.0f : material.roughness);
         commands.buffer.f32(material.normalScale);
         commands.buffer.f32(material.alphaCutoff);
         commands.buffer.u32(flags);
-        commands.buffer.u32(static_cast<uint32_t>(baseTexture));
-        commands.buffer.u32(static_cast<uint32_t>(opacityTexture));
-        commands.buffer.u32(static_cast<uint32_t>(normalTexture));
-        commands.buffer.u32(static_cast<uint32_t>(ormTexture));
-        commands.buffer.u32(static_cast<uint32_t>(emissiveTexture));
-        commands.buffer.u32(material.opacityChannel);
-        commands.buffer.u32(material.roughnessChannel);
-        commands.buffer.u32(material.metallicChannel);
-        commands.buffer.u32(material.occlusionChannel);
+        for (const int32_t textureId : textureIds) {
+            commands.buffer.u32(static_cast<uint32_t>(textureId));
+        }
+        for (size_t index = 0; index < textureIds.size(); ++index) {
+            commands.buffer.u32(textureIds[index] >= 0 ? authoredChannels[index]
+                                                       : kMissingOffset);
+        }
         commands.end(record);
     }
 }
@@ -1968,15 +2728,14 @@ packScene(const SceneData& scene, SceneBuffers& result)
          ++skeletonIndex) {
         const SkeletonData& skeleton = scene.skeletons[skeletonIndex];
         boneIds[skeletonIndex].resize(skeleton.joints.size());
-        data.align();
-        const uint32_t jointsOffset = data.size();
         struct PendingJoint
         {
             uint32_t parent;
             uint32_t boneId;
             uint32_t nameOffset;
             uint32_t nameLength;
-            uint32_t matrixOffset;
+            uint32_t restMatrixOffset;
+            uint32_t bindMatrixOffset;
         };
         std::vector<PendingJoint> pending;
         pending.reserve(skeleton.joints.size());
@@ -1986,8 +2745,10 @@ packScene(const SceneData& scene, SceneBuffers& result)
             uint32_t nameLength = 0;
             const uint32_t nameOffset =
               appendString(data, skeleton.joints[jointIndex].GetString(), nameLength);
-            const uint32_t matrixOffset =
+            const uint32_t restMatrixOffset =
               appendMatrix(data, skeleton.restTransforms[jointIndex]);
+            const uint32_t bindMatrixOffset =
+              appendMatrix(data, skeleton.bindTransforms[jointIndex]);
             pending.push_back({
                 skeleton.parents[jointIndex] >= 0
                   ? static_cast<uint32_t>(skeleton.parents[jointIndex])
@@ -1995,7 +2756,8 @@ packScene(const SceneData& scene, SceneBuffers& result)
                 boneId,
                 nameOffset,
                 nameLength,
-                matrixOffset,
+                restMatrixOffset,
+                bindMatrixOffset,
             });
         }
         data.align();
@@ -2005,9 +2767,9 @@ packScene(const SceneData& scene, SceneBuffers& result)
             data.u32(joint.boneId);
             data.u32(joint.nameOffset);
             data.u32(joint.nameLength);
-            data.u32(joint.matrixOffset);
+            data.u32(joint.restMatrixOffset);
+            data.u32(joint.bindMatrixOffset);
         }
-        (void)jointsOffset;
         uint32_t nameLength = 0;
         const uint32_t nameOffset = appendString(data, skeleton.name, nameLength);
         const uint32_t record = commands.begin(Command::Skeleton);
@@ -2019,6 +2781,8 @@ packScene(const SceneData& scene, SceneBuffers& result)
         commands.end(record);
     }
 
+    std::vector<std::vector<uint32_t>> morphTargetIds(scene.meshes.size());
+    uint32_t nextMorphTargetId = 1;
     for (size_t meshIndex = 0; meshIndex < scene.meshes.size(); ++meshIndex) {
         const MeshData& mesh = scene.meshes[meshIndex];
         const uint32_t positionsOffset = appendArray(data, mesh.positions);
@@ -2118,6 +2882,31 @@ packScene(const SceneData& scene, SceneBuffers& result)
         commands.end(meshRecord);
         ++result.meshCount;
 
+        morphTargetIds[meshIndex].reserve(mesh.morphTargets.size());
+        for (const MorphTargetData& target : mesh.morphTargets) {
+            const uint32_t targetId = nextMorphTargetId++;
+            morphTargetIds[meshIndex].push_back(targetId);
+            const uint32_t positionsOffset =
+              appendArray(data, target.positions);
+            const uint32_t normalsOffset =
+              appendArray(data, target.normals);
+            uint32_t targetNameLength = 0;
+            const uint32_t targetNameOffset =
+              appendString(data, target.name, targetNameLength);
+            const uint32_t targetRecord =
+              commands.begin(Command::MorphTarget);
+            commands.buffer.u32(targetId);
+            commands.buffer.u32(static_cast<uint32_t>(meshIndex + 1));
+            commands.buffer.u32(targetNameOffset);
+            commands.buffer.u32(targetNameLength);
+            commands.buffer.u32(
+              static_cast<uint32_t>(target.positions.size()));
+            commands.buffer.u32(positionsOffset);
+            commands.buffer.u32(normalsOffset);
+            commands.buffer.f32(target.influence);
+            commands.end(targetRecord);
+        }
+
         for (size_t placement = 1; placement < mesh.nodeIds.size(); ++placement) {
             const std::string name = mesh.name + " instance";
             uint32_t instanceNameLength = 0;
@@ -2175,6 +2964,28 @@ packScene(const SceneData& scene, SceneBuffers& result)
         }
     }
 
+    for (const ThinInstanceData& batch : scene.thinInstances) {
+        if (batch.transforms.empty()) {
+            continue;
+        }
+        data.align();
+        const uint32_t transformsOffset = data.size();
+        for (const GfMatrix4d& transform : batch.transforms) {
+            appendMatrix(data, transform);
+        }
+        const uint32_t sourceId =
+          batch.analyticSource
+            ? static_cast<uint32_t>(
+                scene.meshes.size() + batch.sourceIndex + 1)
+            : static_cast<uint32_t>(batch.sourceIndex + 1);
+        const uint32_t record = commands.begin(Command::ThinInstances);
+        commands.buffer.u32(sourceId);
+        commands.buffer.u32(transformsOffset);
+        commands.buffer.u32(static_cast<uint32_t>(batch.transforms.size()));
+        commands.end(record);
+        result.instanceCount += batch.transforms.size();
+    }
+
     for (size_t nodeIndex = 0; nodeIndex < scene.nodes.size(); ++nodeIndex) {
         const NodeAnimation& animation = scene.nodes[nodeIndex].animation;
         emitAnimation(commands,
@@ -2206,6 +3017,25 @@ packScene(const SceneData& scene, SceneBuffers& result)
                           matrices.data(),
                           matrices.size() * sizeof(GfMatrix4f),
                           16);
+        }
+    }
+
+    for (size_t meshIndex = 0; meshIndex < scene.meshes.size(); ++meshIndex) {
+        const MeshData& mesh = scene.meshes[meshIndex];
+        for (size_t targetIndex = 0;
+             targetIndex < mesh.morphTargets.size();
+             ++targetIndex) {
+            const MorphTargetAnimation& animation =
+              mesh.morphTargets[targetIndex].animation;
+            emitAnimation(commands,
+                          data,
+                          AnimationTarget::MorphTarget,
+                          morphTargetIds[meshIndex][targetIndex],
+                          AnimationProperty::Influence,
+                          animation.times,
+                          animation.influences.data(),
+                          animation.influences.size() * sizeof(float),
+                          1);
         }
     }
 

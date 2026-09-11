@@ -35,10 +35,10 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "peerDependencies": {
-    "@babylonjs/core": ">=9.0.0"
+    "@babylonjs/core": ">=9.26.0"
   },
   "devDependencies": {
-    "@babylonjs/core": "9.19.1",
+    "@babylonjs/core": "9.26.0",
     "@types/node": "^22.10.2",
     "rimraf": "^6.0.1",
     "typescript": "^5.7.2"
