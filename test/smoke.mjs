@@ -141,17 +141,97 @@ try {
     const rootBindOffset = dataView.getUint32(jointsOffset + 20, true);
     const childRestOffset = dataView.getUint32(jointsOffset + 40, true);
     const childBindOffset = dataView.getUint32(jointsOffset + 44, true);
+    const skeletonNode = records.find((record) => {
+        if (record.opcode !== 4) {
+            return false;
+        }
+        const nameOffset = view.getUint32(record.offset + 8, true);
+        const nameLength = view.getUint32(record.offset + 12, true);
+        return (
+            new TextDecoder().decode(
+                data.subarray(nameOffset, nameOffset + nameLength),
+            ) === "Rig"
+        );
+    });
+    const mesh = records.find((record) => record.opcode === 7);
+    const geometry = records.find((record) => record.opcode === 6);
+    const positionsOffset = geometry
+        ? view.getUint32(geometry.offset + 16, true)
+        : 0;
     if (
         Math.abs(dataView.getFloat32(rootRestOffset + 52, true) - 5) > 1e-6 ||
         Math.abs(dataView.getFloat32(rootBindOffset + 52, true) - 2) > 1e-6 ||
         Math.abs(dataView.getFloat32(childRestOffset + 48, true) - 3) > 1e-6 ||
-        Math.abs(dataView.getFloat32(childBindOffset + 48, true) - 3) > 1e-6
+        Math.abs(dataView.getFloat32(childBindOffset + 48, true) - 3) > 1e-6 ||
+        !skeletonNode ||
+        !mesh ||
+        !geometry ||
+        view.getUint32(mesh.offset + 4, true) !==
+            view.getUint32(skeletonNode.offset, true) ||
+        Math.abs(dataView.getFloat32(positionsOffset, true) - 7) > 1e-6
     ) {
-        throw new Error("Skeleton rest and local bind transforms were not preserved.");
+        throw new Error(
+            "Skeleton bind transforms or skeleton-space mesh placement were not preserved.",
+        );
     }
 } finally {
     bindPoseResult.delete();
     module.FS.unlink(bindPosePath);
+}
+
+const skinnedInstancesPath = "/test/skinned-instances.usda";
+module.FS.writeFile(
+    skinnedInstancesPath,
+    await readFile(resolve(root, "test", "assets", "skinned-instances.usda")),
+);
+const skinnedInstancesResult = module.extract(skinnedInstancesPath);
+try {
+    if (!skinnedInstancesResult.ok()) {
+        throw new Error(skinnedInstancesResult.error());
+    }
+    if (
+        skinnedInstancesResult.meshCount() !== 1 ||
+        skinnedInstancesResult.instanceCount() !== 1
+    ) {
+        throw new Error(
+            "Native-instanced skinned geometry did not preserve source sharing.",
+        );
+    }
+    const { view, records } = commandRecords(skinnedInstancesResult);
+    const data = module.HEAPU8.slice(
+        skinnedInstancesResult.dataPtr(),
+        skinnedInstancesResult.dataPtr() + skinnedInstancesResult.dataSize(),
+    );
+    const rigNodeIds = records
+        .filter((record) => record.opcode === 4)
+        .filter((record) => {
+            const nameOffset = view.getUint32(record.offset + 8, true);
+            const nameLength = view.getUint32(record.offset + 12, true);
+            return (
+                new TextDecoder().decode(
+                    data.subarray(nameOffset, nameOffset + nameLength),
+                ) === "Rig"
+            );
+        })
+        .map((record) => view.getUint32(record.offset, true));
+    const mesh = records.find((record) => record.opcode === 7);
+    const instance = records.find((record) => record.opcode === 8);
+    if (
+        rigNodeIds.length !== 2 ||
+        !mesh ||
+        !instance ||
+        !rigNodeIds.includes(view.getUint32(mesh.offset + 4, true)) ||
+        !rigNodeIds.includes(view.getUint32(instance.offset + 4, true)) ||
+        view.getUint32(mesh.offset + 4, true) ===
+            view.getUint32(instance.offset + 4, true)
+    ) {
+        throw new Error(
+            "Native-instanced skinned meshes were not parented to their instance-proxy Skeleton nodes.",
+        );
+    }
+} finally {
+    skinnedInstancesResult.delete();
+    module.FS.unlink(skinnedInstancesPath);
 }
 
 const pointInstancerPath = "/test/point-instancer.usda";

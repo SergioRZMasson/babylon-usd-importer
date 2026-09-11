@@ -329,6 +329,7 @@ struct ThinInstanceData
 struct SkinBinding
 {
     uint32_t skeletonId = kMissingOffset;
+    SdfPath skeletonPath;
     UsdSkelSkinningQuery query;
     std::vector<uint16_t> jointMap;
 };
@@ -1252,6 +1253,39 @@ buildJointMap(const UsdSkelSkinningQuery& skinningQuery, const VtTokenArray& ske
     return result;
 }
 
+SdfPath
+mappedSkeletonPath(const UsdSkelSkinningQuery& skinningQuery,
+                   const SdfPath& skeletonPath)
+{
+    const UsdPrim skinningPrim = skinningQuery.GetPrim();
+    if (!skinningPrim.IsInstanceProxy()) {
+        return skeletonPath;
+    }
+    const UsdPrim prototypePrim = skinningPrim.GetPrimInPrototype();
+    if (!prototypePrim) {
+        return skeletonPath;
+    }
+    SdfPath prototypeRoot;
+    for (const SdfPath& prefix : prototypePrim.GetPath().GetPrefixes()) {
+        if (UsdPrim::IsPrototypePath(prefix)) {
+            prototypeRoot = prefix;
+            break;
+        }
+    }
+    if (prototypeRoot.IsEmpty() || !skeletonPath.HasPrefix(prototypeRoot)) {
+        return skeletonPath;
+    }
+
+    SdfPath instanceRoot = skinningPrim.GetPath();
+    size_t relativeElementCount =
+      prototypePrim.GetPath().GetPathElementCount() -
+      prototypeRoot.GetPathElementCount();
+    while (relativeElementCount-- > 0) {
+        instanceRoot = instanceRoot.GetParentPath();
+    }
+    return skeletonPath.ReplacePrefix(prototypeRoot, instanceRoot);
+}
+
 uint32_t
 registerSkeleton(SceneData& scene, const UsdSkelSkeletonQuery& query)
 {
@@ -1341,6 +1375,9 @@ collectSkeletonBindings(const UsdStageRefPtr& stage, SceneData& scene)
                  binding.GetSkinningTargets()) {
                 SkinBinding skin;
                 skin.skeletonId = skeletonId;
+                skin.skeletonPath =
+                  mappedSkeletonPath(skinningQuery,
+                                     skeletonQuery.GetPrim().GetPath());
                 skin.query = skinningQuery;
                 skin.jointMap = buildJointMap(skinningQuery, skeleton.joints);
                 scene.skinBindings[skinningQuery.GetPrim().GetPath().GetString()] =
@@ -1744,6 +1781,18 @@ extractMesh(const UsdGeomMesh& usdMesh,
     const bool outputLeftHanded = sourceLeftHanded != bakedReflection;
     const uint32_t skeletonId =
       skinningValid ? skin->skeletonId : kMissingOffset;
+    uint32_t placementNodeId = nodeId;
+    if (skinningValid) {
+        const auto skeletonNode =
+          scene.nodeIds.find(skin->skeletonPath.GetString());
+        if (skeletonNode == scene.nodeIds.end()) {
+            TF_WARN("Could not find the Skeleton transform <%s> for skinned mesh <%s>.",
+                    skin->skeletonPath.GetText(),
+                    usdMesh.GetPath().GetText());
+            return false;
+        }
+        placementNodeId = skeletonNode->second;
+    }
     std::string key =
       meshCacheKey(usdMesh.GetPrim(),
                    faceMaterials,
@@ -1751,6 +1800,15 @@ extractMesh(const UsdGeomMesh& usdMesh,
                    doubleSided,
                    outputLeftHanded) +
       cacheSuffix;
+    if (skinningValid) {
+        uint64_t geomBindHash = 1469598103934665603ull;
+        for (size_t row = 0; row < 4; ++row) {
+            for (size_t column = 0; column < 4; ++column) {
+                hashValue(geomBindHash, geomBind[row][column]);
+            }
+        }
+        key += "|g" + std::to_string(geomBindHash);
+    }
     const UsdSkelBindingAPI blendShapeBinding(usdMesh.GetPrim());
     if (blendShapeBinding.GetBlendShapesAttr().HasAuthoredValue()) {
         const UsdPrim animationSource =
@@ -1762,7 +1820,7 @@ extractMesh(const UsdGeomMesh& usdMesh,
     }
     const auto cached = scene.meshIds.find(key);
     if (cached != scene.meshIds.end()) {
-        scene.meshes[cached->second].nodeIds.push_back(nodeId);
+        scene.meshes[cached->second].nodeIds.push_back(placementNodeId);
         if (meshIndexOut) {
             *meshIndexOut = cached->second;
         }
@@ -1889,7 +1947,7 @@ extractMesh(const UsdGeomMesh& usdMesh,
         target.target.normalOffsets = std::move(target.normalOffsets);
         mesh.morphTargets.push_back(std::move(target.target));
     }
-    mesh.nodeIds.push_back(nodeId);
+    mesh.nodeIds.push_back(placementNodeId);
     const size_t meshIndex = scene.meshes.size();
     scene.meshIds.emplace(key, meshIndex);
     scene.meshes.push_back(std::move(mesh));
@@ -2318,20 +2376,30 @@ extractStage(const UsdStageRefPtr& stage, SceneData& scene)
     for (auto iterator = range.begin(); iterator != range.end(); ++iterator) {
         const UsdPrim prim = *iterator;
         const bool isPointInstancer = prim.IsA<UsdGeomPointInstancer>();
+        const UsdGeomXformable xformable(prim);
+        if (xformable) {
+            scene.nodes.push_back(readNode(prim, scene));
+            scene.nodeIds[prim.GetPath().GetString()] =
+              static_cast<uint32_t>(scene.nodes.size());
+        }
+        if (isPointInstancer) {
+            iterator.PruneChildren();
+        }
+    }
+
+    range = stage->Traverse(UsdTraverseInstanceProxies());
+    for (auto iterator = range.begin(); iterator != range.end(); ++iterator) {
+        const UsdPrim prim = *iterator;
+        const bool isPointInstancer = prim.IsA<UsdGeomPointInstancer>();
         if (!isPointInstancer && !isVisible(prim)) {
             iterator.PruneChildren();
             continue;
         }
-        const UsdGeomXformable xformable(prim);
-        uint32_t nodeId = kMissingOffset;
-        if (xformable) {
-            scene.nodes.push_back(readNode(prim, scene));
-            nodeId = static_cast<uint32_t>(scene.nodes.size());
-            scene.nodeIds[prim.GetPath().GetString()] = nodeId;
-        }
-        if (nodeId == kMissingOffset) {
+        const auto node = scene.nodeIds.find(prim.GetPath().GetString());
+        if (node == scene.nodeIds.end()) {
             continue;
         }
+        const uint32_t nodeId = node->second;
         if (isPointInstancer) {
             if (!extractPointInstancer(
                   UsdGeomPointInstancer(prim), nodeId, scene)) {

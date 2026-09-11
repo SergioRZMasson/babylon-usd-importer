@@ -12,6 +12,7 @@ node test/smoke.mjs
 - full affine/shear transform preservation;
 - matrix animation;
 - distinct skeleton rest and bind poses;
+- skeleton-space placement for skinned meshes, including native instance proxies;
 - single-frame time-sampled point instancers, prototype transforms, and instance masks;
 - sparse morph targets, normal offsets, in-between weighting, and influence animation;
 - instance-proxy geometry reuse;

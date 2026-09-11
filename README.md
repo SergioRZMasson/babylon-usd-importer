@@ -108,7 +108,8 @@ relationships.
 - Shared source geometry, Babylon instances, and static `UsdGeomPointInstancer`
   batches backed by thin-instance matrix buffers.
 - Up to eight skinning influences.
-- Skeletons, node animation, and skeletal animation.
+- Skeletons, node animation, and skeletal animation, with skinned geometry placed in its
+  bound Skeleton space after applying `geomBindTransform`.
 - Sparse USD blend shapes, authored normal offsets, in-between shapes, and animated
   blend-shape weights materialized through Babylon morph targets.
 

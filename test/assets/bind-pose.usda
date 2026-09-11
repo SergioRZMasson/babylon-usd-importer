@@ -18,7 +18,7 @@ def SkelRoot "Model"
             (1, 0, 0, 0),
             (0, 1, 0, 0),
             (0, 0, 1, 0),
-            (0, 0, 0, 1)
+            (4, 0, 0, 1)
         )
         int[] primvars:skel:jointIndices = [1, 1, 1, 1] (
             elementSize = 1
@@ -30,9 +30,13 @@ def SkelRoot "Model"
         )
         rel skel:skeleton = </Model/Rig>
         uniform token subdivisionScheme = "none"
+        double3 xformOp:translate = (4, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
     }
 
-    def Skeleton "Rig"
+    def Skeleton "Rig" (
+        prepend apiSchemas = ["VisibilityAPI"]
+    )
     {
         uniform matrix4d[] bindTransforms = [
             (
@@ -63,5 +67,6 @@ def SkelRoot "Model"
                 (3, 0, 0, 1)
             )
         ]
+        token visibility = "invisible"
     }
 }
