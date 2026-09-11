@@ -1,7 +1,7 @@
 # Tests
 
 `smoke.mjs` loads the generated Emscripten module in Node and validates protocol payload
-sizes, geometry counts, analytic primitives, and the protocol-v4 material texture layout:
+sizes, geometry counts, analytic primitives, and the protocol-v5 material texture layout:
 
 ```sh
 node test/smoke.mjs

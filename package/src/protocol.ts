@@ -1,5 +1,5 @@
 export const COMMAND_MAGIC = 0x42445355;
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 export const MISSING_OFFSET = 0xffffffff;
 
 export const enum Command {
